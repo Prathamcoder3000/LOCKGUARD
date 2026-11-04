@@ -1,0 +1,53 @@
+# Binaries and build artifacts
+bin/
+dist/
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage/
+
+# Go dependency cache
+vendor/
+
+# Node dependencies and build
+node_modules/
+.pnp
+.pnp.js
+dist/
+dist-ssr/
+*.local
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker and data volumes
+data/
+*.db
+*.bolt
+raft-data/
+postgres-data/
+
+# Logs
+*.log
+logs/

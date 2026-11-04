@@ -1,0 +1,248 @@
+services:
+  # ============================================================================
+  # Storage Layer: PostgreSQL (Users, Audits, Benchmarks, Metadata)
+  # IMPORTANT: Authoritative distributed lock state is NOT stored here.
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: lockguard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-lockguard_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-lockguard_secure_password_replace_in_prod}
+      POSTGRES_DB: ${DB_NAME:-lockguard_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    networks:
+      - lockguard-internal
+    # PostgreSQL is deliberately not exposed to the public host by default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lockguard_user} -d ${DB_NAME:-lockguard_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================================
+  # Consensus Layer: Three-Node Raft Coordinator Cluster
+  # Invariant: 2 of 3 nodes constitute quorum (Fail Closed)
+  # Private Raft network: port 7000 is NOT exposed publicly.
+  # ============================================================================
+  coordinator-a:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.coordinator
+    container_name: lockguard-coordinator-a
+    restart: unless-stopped
+    environment:
+      NODE_ID: coordinator-a
+      RAFT_BIND_ADDR: 0.0.0.0:7000
+      RAFT_ADVERTISE_ADDR: coordinator-a:7000
+      RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      COORDINATOR_API_PORT: 8001
+      COORDINATOR_API_HOST: 0.0.0.0
+      DATA_DIR: /var/lib/lockguard/data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - coordinator_a_data:/var/lib/lockguard/data
+    networks:
+      - lockguard-internal
+      - lockguard-raft
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  coordinator-b:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.coordinator
+    container_name: lockguard-coordinator-b
+    restart: unless-stopped
+    environment:
+      NODE_ID: coordinator-b
+      RAFT_BIND_ADDR: 0.0.0.0:7000
+      RAFT_ADVERTISE_ADDR: coordinator-b:7000
+      RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      COORDINATOR_API_PORT: 8001
+      COORDINATOR_API_HOST: 0.0.0.0
+      DATA_DIR: /var/lib/lockguard/data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - coordinator_b_data:/var/lib/lockguard/data
+    networks:
+      - lockguard-internal
+      - lockguard-raft
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  coordinator-c:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.coordinator
+    container_name: lockguard-coordinator-c
+    restart: unless-stopped
+    environment:
+      NODE_ID: coordinator-c
+      RAFT_BIND_ADDR: 0.0.0.0:7000
+      RAFT_ADVERTISE_ADDR: coordinator-c:7000
+      RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      COORDINATOR_API_PORT: 8001
+      COORDINATOR_API_HOST: 0.0.0.0
+      DATA_DIR: /var/lib/lockguard/data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - coordinator_c_data:/var/lib/lockguard/data
+    networks:
+      - lockguard-internal
+      - lockguard-raft
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============================================================================
+  # Application Gateway: LockGuard Go API Service
+  # ============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.api
+    container_name: lockguard-api
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      HTTP_PORT: 8080
+      HTTP_HOST: 0.0.0.0
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-lockguard_user}
+      DB_PASSWORD: ${DB_PASSWORD:-lockguard_secure_password_replace_in_prod}
+      DB_NAME: ${DB_NAME:-lockguard_db}
+      DB_SSL_MODE: disable
+      RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      coordinator-a:
+        condition: service_healthy
+      coordinator-b:
+        condition: service_healthy
+      coordinator-c:
+        condition: service_healthy
+    networks:
+      - lockguard-internal
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============================================================================
+  # Protected Resource Service: Validates Fencing Tokens on Mutations
+  # ============================================================================
+  protected-resource:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.protected-resource
+    container_name: lockguard-protected-resource
+    restart: unless-stopped
+    environment:
+      PROTECTED_RESOURCE_PORT: 9000
+    networks:
+      - lockguard-internal
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============================================================================
+  # Frontend Application: React + Vite + TypeScript Dashboard
+  # ============================================================================
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.frontend
+    container_name: lockguard-frontend
+    restart: unless-stopped
+    networks:
+      - lockguard-internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============================================================================
+  # Reverse Proxy: Nginx Public Edge Gateway
+  # ============================================================================
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: lockguard-nginx
+    restart: unless-stopped
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - lockguard-internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/gateway/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============================================================================
+  # Observability: Prometheus Metrics Scraper
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: lockguard-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - lockguard-internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+# ==============================================================================
+# Isolated Networks
+# ==============================================================================
+networks:
+  lockguard-internal:
+    driver: bridge
+  # Dedicated private network for Raft peer traffic (not exposed externally)
+  lockguard-raft:
+    driver: bridge
+    internal: true
+
+# ==============================================================================
+# Persistent Volumes
+# ==============================================================================
+volumes:
+  postgres_data:
+  coordinator_a_data:
+  coordinator_b_data:
+  coordinator_c_data:

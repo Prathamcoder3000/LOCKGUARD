@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'lockguard-api'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api:9090']
+
+  - job_name: 'lockguard-coordinators'
+    static_configs:
+      - targets: ['coordinator-a:8001', 'coordinator-b:8001', 'coordinator-c:8001']
+
+  - job_name: 'lockguard-protected-resource'
+    static_configs:
+      - targets: ['protected-resource:9000']

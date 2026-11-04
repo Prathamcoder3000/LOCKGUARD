@@ -1,0 +1,89 @@
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { ShieldCheck, Lock, User, ArrowRight } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+
+export const LoginPage: React.FC = () => {
+  const [username, setUsername] = useState('cluster-admin');
+  const [password, setPassword] = useState('password123');
+  const { login } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    login('dev-token-session-token', {
+      id: 'usr-admin-01',
+      username: username || 'operator',
+      role: 'admin',
+      email: 'admin@lockguard.internal',
+    });
+    navigate('/');
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-[#070C1E] px-4 py-12 sm:px-6 lg:px-8">
+      <div className="w-full max-w-md space-y-8 rounded-2xl border border-white/10 bg-[#0B132B] p-8 shadow-2xl">
+        <div className="text-center">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-tr from-blue-600 to-violet-600 shadow-lg shadow-blue-500/30">
+            <ShieldCheck className="h-7 w-7 text-white" />
+          </div>
+          <h2 className="mt-4 text-2xl font-bold tracking-tight text-white">LOCKGUARD</h2>
+          <p className="mt-1 text-xs uppercase tracking-wider text-blue-400 font-semibold">
+            Fault-Tolerant Distributed Coordination
+          </p>
+          <p className="mt-2 text-xs text-slate-400">
+            Sign in to access cluster topology, locks, and consensus monitoring.
+          </p>
+        </div>
+
+        <form className="mt-8 space-y-4" onSubmit={handleSubmit}>
+          <div>
+            <label className="block text-xs font-medium text-slate-300">Username</label>
+            <div className="relative mt-1">
+              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                <User className="h-4 w-4 text-slate-500" />
+              </div>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="block w-full rounded-lg border border-white/10 bg-white/5 py-2 pl-9 pr-3 text-sm text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                placeholder="admin"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300">Password</label>
+            <div className="relative mt-1">
+              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                <Lock className="h-4 w-4 text-slate-500" />
+              </div>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="block w-full rounded-lg border border-white/10 bg-white/5 py-2 pl-9 pr-3 text-sm text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                placeholder="••••••••"
+                required
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            className="flex w-full items-center justify-center space-x-2 rounded-lg bg-blue-600 py-2.5 text-sm font-semibold text-white shadow-md shadow-blue-500/25 transition-all hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-[#0B132B]"
+          >
+            <span>Enter Dashboard</span>
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </form>
+
+        <div className="border-t border-white/10 pt-4 text-center text-[11px] text-slate-400">
+          Academic Project • Fault Tolerant Distributed Lock Service
+        </div>
+      </div>
+    </div>
+  );
+};
