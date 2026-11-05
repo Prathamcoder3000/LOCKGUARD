@@ -33,6 +33,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Lease.DefaultTTLSec != 10 {
 		t.Errorf("expected default lease TTL 10s, got %d", cfg.Lease.DefaultTTLSec)
 	}
+
+	if len(cfg.Gateway.CoordinatorEndpoints) == 0 {
+		t.Errorf("expected default coordinator endpoints to be non-empty")
+	}
+
+	if cfg.Heartbeat.Interval >= cfg.Heartbeat.Timeout {
+		t.Errorf("expected heartbeat interval < timeout, got %v >= %v", cfg.Heartbeat.Interval, cfg.Heartbeat.Timeout)
+	}
+
+	if cfg.Renewal.SafetyMargin <= 0 {
+		t.Errorf("expected positive renewal safety margin, got %v", cfg.Renewal.SafetyMargin)
+	}
 }
 
 func TestConfigValidationFailure(t *testing.T) {

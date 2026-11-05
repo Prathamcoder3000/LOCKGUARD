@@ -39,6 +39,8 @@ services:
       RAFT_BIND_ADDR: 0.0.0.0:7000
       RAFT_ADVERTISE_ADDR: coordinator-a:7000
       RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      BOOTSTRAP_LEADER: coordinator-a
+      BOOTSTRAP: "true"
       COORDINATOR_API_PORT: 8001
       COORDINATOR_API_HOST: 0.0.0.0
       DATA_DIR: /var/lib/lockguard/data
@@ -65,6 +67,8 @@ services:
       RAFT_BIND_ADDR: 0.0.0.0:7000
       RAFT_ADVERTISE_ADDR: coordinator-b:7000
       RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      BOOTSTRAP_LEADER: coordinator-a
+      BOOTSTRAP: "false"
       COORDINATOR_API_PORT: 8001
       COORDINATOR_API_HOST: 0.0.0.0
       DATA_DIR: /var/lib/lockguard/data
@@ -91,6 +95,8 @@ services:
       RAFT_BIND_ADDR: 0.0.0.0:7000
       RAFT_ADVERTISE_ADDR: coordinator-c:7000
       RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      BOOTSTRAP_LEADER: coordinator-a
+      BOOTSTRAP: "false"
       COORDINATOR_API_PORT: 8001
       COORDINATOR_API_HOST: 0.0.0.0
       DATA_DIR: /var/lib/lockguard/data
@@ -125,7 +131,28 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-lockguard_secure_password_replace_in_prod}
       DB_NAME: ${DB_NAME:-lockguard_db}
       DB_SSL_MODE: disable
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: ${DB_USER:-lockguard_user}
+      DATABASE_PASSWORD: ${DB_PASSWORD:-lockguard_secure_password_replace_in_prod}
+      DATABASE_NAME: ${DB_NAME:-lockguard_db}
+      DATABASE_SSLMODE: disable
+      DATABASE_MAX_OPEN_CONNS: 20
+      DATABASE_MAX_IDLE_CONNS: 10
+      DATABASE_CONN_MAX_LIFETIME: 30m
+      DATABASE_CONN_TIMEOUT: 5s
       RAFT_CLUSTER_NODES: coordinator-a:7000,coordinator-b:7000,coordinator-c:7000
+      COORDINATOR_ENDPOINTS: http://coordinator-a:8001,http://coordinator-b:8001,http://coordinator-c:8001
+      GATEWAY_LEADER_CACHE_TTL_MS: 5000
+      GATEWAY_MAX_REDIRECT_ATTEMPTS: 2
+      GATEWAY_REQUEST_TIMEOUT_MS: 5000
+      HEARTBEAT_INTERVAL_MS: 3000
+      HEARTBEAT_TIMEOUT_MS: 10000
+      HEARTBEAT_CLEANUP_INTERVAL_MS: 2000
+      RENEWAL_SAFETY_MARGIN_MS: 2000
+      RENEWAL_RETRY_INITIAL_MS: 100
+      RENEWAL_RETRY_MAX_MS: 2000
+      RENEWAL_MAX_ATTEMPTS: 3
       LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:

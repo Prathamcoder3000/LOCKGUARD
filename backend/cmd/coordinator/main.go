@@ -10,14 +10,16 @@ import (
 	"syscall"
 	"time"
 
-	"lockguard/backend/internal/api"
 	"lockguard/backend/internal/config"
+	"lockguard/backend/internal/consensus"
+	"lockguard/backend/internal/coordinator"
+	"lockguard/backend/internal/lockstate"
 	"lockguard/backend/internal/middleware"
 )
 
 const (
 	ServiceName = "lockguard-coordinator"
-	Version     = "0.1.0"
+	Version     = "0.2.0"
 )
 
 func main() {
@@ -56,21 +58,45 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize deterministic in-memory lock state machine
+	sm := lockstate.New()
+
+	// Determine if this node should execute bootstrap when storage is empty
+	bootstrapLeader := os.Getenv("BOOTSTRAP_LEADER")
+	if bootstrapLeader == "" {
+		bootstrapLeader = "coordinator-a"
+	}
+	shouldBootstrap := (cfg.Raft.NodeID == bootstrapLeader || os.Getenv("BOOTSTRAP") == "true")
+
+	// Initialize HashiCorp Raft consensus node
+	raftCfg := consensus.NodeConfig{
+		NodeID:            cfg.Raft.NodeID,
+		BindAddr:          cfg.Raft.BindAddr,
+		AdvertiseAddr:     cfg.Raft.AdvertiseAddr,
+		DataDir:           cfg.Storage.DataDir,
+		ClusterNodes:      cfg.Raft.ClusterNodes,
+		HeartbeatTimeout:  cfg.Raft.HeartbeatTimeout,
+		ElectionTimeout:   cfg.Raft.ElectionTimeout,
+		CommitTimeout:     cfg.Raft.CommitTimeout,
+		SnapshotInterval:  cfg.Raft.SnapshotIntervalSec,
+		SnapshotThreshold: cfg.Raft.SnapshotThreshold,
+		RetainSnapshots:   2,
+		Inmem:             false,
+		LogLevel:          cfg.LogLevel,
+		Logger:            logger,
+		BootstrapCluster:  shouldBootstrap,
+	}
+
+	raftNode, err := consensus.NewRaftNode(raftCfg, sm)
+	if err != nil {
+		logger.Error("failed_to_initialize_raft_node", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// Setup coordinator HTTP handlers
+	coordHandler := coordinator.NewHandler(raftNode, cfg.Raft.NodeID)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", api.HealthHandler(ServiceName, Version, cfg.Raft.NodeID))
-	mux.HandleFunc("/ready", api.ReadinessHandler(cfg, ServiceName, cfg.Raft.NodeID))
-	mux.HandleFunc("/cluster/info", func(w http.ResponseWriter, r *http.Request) {
-		info := map[string]interface{}{
-			"node_id":          cfg.Raft.NodeID,
-			"raft_bind":        cfg.Raft.BindAddr,
-			"raft_advertise":   cfg.Raft.AdvertiseAddr,
-			"peers":            cfg.Raft.ClusterNodes,
-			"state":            "phase0_initialized",
-			"storage_dir":      cfg.Storage.DataDir,
-			"fail_closed_rule": "2 of 3 nodes required for quorum commit",
-		}
-		api.RespondSuccess(w, http.StatusOK, info)
-	})
+	coordHandler.RegisterRoutes(mux)
 
 	var httpHandler http.Handler = mux
 	httpHandler = middleware.RequestLogger(logger)(httpHandler)
@@ -105,6 +131,10 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("coordinator_shutdown_error", slog.String("error", err.Error()))
 	}
+
+	if err := raftNode.Close(); err != nil {
+		logger.Error("raft_node_close_error", slog.String("error", err.Error()))
+	}
+
 	logger.Info("coordinator_stopped", slog.String("node_id", cfg.Raft.NodeID))
 }
-

@@ -23,6 +23,33 @@ type Config struct {
 	Storage StorageConfig
 	Lease   LeaseConfig
 	Metrics MetricsConfig
+
+	Gateway   GatewayConfig
+	Heartbeat HeartbeatConfig
+	Renewal   RenewalConfig
+}
+
+// GatewayConfig defines reverse-proxy and leader-discovery settings.
+type GatewayConfig struct {
+	CoordinatorEndpoints []string
+	LeaderCacheTTL       time.Duration
+	MaxRedirectAttempts  int
+	RequestTimeout       time.Duration
+}
+
+// HeartbeatConfig defines client heartbeat session management settings.
+type HeartbeatConfig struct {
+	Interval        time.Duration
+	Timeout         time.Duration
+	CleanupInterval time.Duration
+}
+
+// RenewalConfig defines automatic lease renewal parameters.
+type RenewalConfig struct {
+	SafetyMargin time.Duration
+	RetryInitial time.Duration
+	RetryMax     time.Duration
+	MaxAttempts  int
 }
 
 // HTTPConfig defines the HTTP server parameters.
@@ -162,6 +189,26 @@ func LoadConfig() (*Config, error) {
 			Enabled: getEnvBool("METRICS_ENABLED", true),
 			Port:    getEnvInt("METRICS_PORT", 9090),
 		},
+
+		Gateway: GatewayConfig{
+			CoordinatorEndpoints: parseCommaSeparated(getEnv("COORDINATOR_ENDPOINTS", "http://127.0.0.1:8001")),
+			LeaderCacheTTL:       time.Duration(getEnvInt("GATEWAY_LEADER_CACHE_TTL_MS", 5000)) * time.Millisecond,
+			MaxRedirectAttempts:  getEnvInt("GATEWAY_MAX_REDIRECT_ATTEMPTS", 2),
+			RequestTimeout:       time.Duration(getEnvInt("GATEWAY_REQUEST_TIMEOUT_MS", 5000)) * time.Millisecond,
+		},
+
+		Heartbeat: HeartbeatConfig{
+			Interval:        time.Duration(getEnvInt("HEARTBEAT_INTERVAL_MS", 3000)) * time.Millisecond,
+			Timeout:         time.Duration(getEnvInt("HEARTBEAT_TIMEOUT_MS", 10000)) * time.Millisecond,
+			CleanupInterval: time.Duration(getEnvInt("HEARTBEAT_CLEANUP_INTERVAL_MS", 2000)) * time.Millisecond,
+		},
+
+		Renewal: RenewalConfig{
+			SafetyMargin: time.Duration(getEnvInt("RENEWAL_SAFETY_MARGIN_MS", 2000)) * time.Millisecond,
+			RetryInitial: time.Duration(getEnvInt("RENEWAL_RETRY_INITIAL_MS", 100)) * time.Millisecond,
+			RetryMax:     time.Duration(getEnvInt("RENEWAL_RETRY_MAX_MS", 2000)) * time.Millisecond,
+			MaxAttempts:  getEnvInt("RENEWAL_MAX_ATTEMPTS", 3),
+		},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -205,6 +252,18 @@ func (c *Config) Validate() error {
 
 	if c.HTTP.ShutdownTimeout <= 0 {
 		errs = append(errs, "HTTP shutdown timeout must be positive")
+	}
+
+	if c.Gateway.MaxRedirectAttempts < 0 {
+		errs = append(errs, "Gateway max redirect attempts cannot be negative")
+	}
+
+	if c.Heartbeat.Timeout > 0 && c.Heartbeat.Interval > 0 && c.Heartbeat.Interval >= c.Heartbeat.Timeout {
+		errs = append(errs, "Heartbeat interval must be strictly less than heartbeat timeout")
+	}
+
+	if c.Renewal.MaxAttempts < 0 {
+		errs = append(errs, "Renewal max attempts cannot be negative")
 	}
 
 	if c.Environment == "production" {

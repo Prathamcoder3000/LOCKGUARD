@@ -19,6 +19,7 @@
 
 The system implements:
 - Distributed lock acquisition, lease heartbeats, and Martin Kleppmann's fencing tokens.
+- Deterministic, concurrency-safe in-memory state machine with request-level idempotency (`backend/internal/lockstate`).
 - Majority quorum replication ($2 \text{ of } 3 \text{ nodes}$) with strictly fail-closed semantics upon quorum loss.
 - In-memory replicated state machine backed by durable BoltDB consensus logs and snapshot recovery.
 - Independent fencing state verification at external protected resources.
@@ -70,7 +71,7 @@ The system implements:
 
 ## 3. Technology Stack
 
-- **Backend:** Go (`go1.27.3`), HashiCorp Raft (`github.com/hashicorp/raft` v1.7.2 candidate), structured logging (`log/slog`), HTTP middleware stack.
+- **Backend:** Go (`go1.27.3`), HashiCorp Raft (`github.com/hashicorp/raft` v1.7.2 + `github.com/hashicorp/raft-boltdb/v2` v2.3.1), structured logging (`log/slog`), HTTP middleware stack.
 - **Frontend:** React 18, Vite 6, TypeScript 5.7, Tailwind CSS 3.4, React Router 6, Axios, Lucide React, Recharts.
 - **Storage:**
   - *Consensus Tier:* Local BoltDB log store, stable metadata store, and file snapshot storage per coordinator node.
@@ -86,7 +87,7 @@ The system implements:
 LOCKGUARD/
   ├── backend/                     # Go Coordination Engine & API Gateway
   │   ├── cmd/
-  │   │   ├── api/                 # LockGuard REST API entry point
+  │   │   ├── api/                 # LockGuard REST API & Gateway entry point
   │   │   └── coordinator/         # Coordinator daemon entry point (Nodes A, B, C)
   │   ├── internal/
   │   │   ├── api/                 # Server, handlers, standardized JSON envelopes
@@ -95,16 +96,44 @@ LOCKGUARD/
   │   │   ├── benchmark/           # Benchmark orchestration
   │   │   ├── cluster/             # Cluster topology definitions
   │   │   ├── config/              # Environment config loading & validation
-  │   │   ├── consensus/           # Raft consensus wrappers
+  │   │   ├── consensus/           # HashiCorp Raft FSM, cluster bootstrap, codecs
+  │   │   ├── coordinator/         # Coordinator HTTP handlers & linearizable reads
   │   │   ├── events/              # Event dispatching
+  │   │   ├── fencing/             # Fencing token utilities
+  │   │   ├── gateway/             # Leader discovery, reverse proxy, 421 retry
+  │   │   ├── heartbeat/           # Client session tracking & inactivity scrubber
+  │   │   ├── leases/              # High-level lease abstractions
+  │   │   ├── locks/               # Lock manager services
+  │   │   ├── lockstate/           # Phase 1A deterministic state machine
+  │   │   ├── metrics/             # Concurrency-safe Prometheus registry (/metrics)
+  │   │   ├── middleware/          # CORS, panic recovery, structured logging
+  │   │   ├── recovery/            # Crash recovery & log replay
+  │   │   ├── renewal/             # Automated lease renewal scheduler & workers
+  │   │   ├── snapshots/           # Snapshot stores
+  │   │   ├── state_machine/       # Legacy interfaces
+  │   │   └── storage/             # PostgreSQL cold storage layer
+  │   └── tests/                   # End-to-end integration test scenarios (A-I)
   │   │   ├── fencing/             # Fencing token counters
   │   │   ├── leases/              # Lease TTL managers
   │   │   ├── locks/               # Lock state logic
+  │   │   ├── lockstate/           # Deterministic In-Memory Lock State Machine (Phase 1A)
+  │   │   │   ├── types.go         # LockRecord, ResourceState, IdempotencyRecord
+  │   │   │   ├── commands.go      # Acquire, Renew, Release, Expire commands & SHA-256 fingerprints
+  │   │   │   ├── state_machine.go # StateMachine interface & MemoryStateMachine (sync.RWMutex)
+  │   │   │   ├── acquire.go       # Monotonic fencing token acquire logic
+  │   │   │   ├── renew.go         # Token-preserving lease renewal logic
+  │   │   │   ├── release.go       # Safe explicit release logic
+  │   │   │   ├── expire.go        # Deterministic expiration logic
+  │   │   │   ├── query.go         # Safe cloned read-only queries
+  │   │   │   ├── errors.go        # Sentinel error definitions & codes
+  │   │   │   ├── fixtures_test.go # Test timestamps & command builders
+  │   │   │   ├── state_machine_test.go # Unit tests (Categories A–G)
+  │   │   │   └── concurrency_test.go   # Stress & race tests (Category H)
   │   │   ├── metrics/             # Prometheus metric counters
   │   │   ├── middleware/          # Slog logger, CORS, panic recovery
   │   │   ├── recovery/            # Crash recovery & log replay
   │   │   ├── snapshots/           # Snapshot managers
-  │   │   ├── state_machine/       # Replicated FSM
+  │   │   ├── state_machine/       # Replicated FSM integration
   │   │   └── storage/             # PostgreSQL connection pool
   │   ├── migrations/              # PostgreSQL schema migrations
   │   └── tests/                   # Backend unit tests
@@ -158,11 +187,97 @@ LOCKGUARD/
 
 ---
 
-## 5. Verification & Test Results (Phase 0)
+## 5. Verification & Test Results
 
-All acceptance criteria for Phase 0 have been verified:
+### 1. Phase 1A: Lock State Machine Verification (`backend/internal/lockstate`)
+All 32 test suites across Categories A–I passed cleanly without data races:
 
-### 1. Backend Verification (`backend/tests`)
+```powershell
+go test -v -count=1 ./internal/lockstate
+```
+```
+=== RUN   TestConcurrentAcquireSingleResource
+--- PASS: TestConcurrentAcquireSingleResource (0.00s)
+=== RUN   TestConcurrentRenewals
+--- PASS: TestConcurrentRenewals (0.00s)
+=== RUN   TestConcurrentReleaseAndAcquire
+--- PASS: TestConcurrentReleaseAndAcquire (0.00s)
+=== RUN   TestConcurrentMultiResourceStress
+--- PASS: TestConcurrentMultiResourceStress (0.00s)
+=== RUN   TestAcquireUnlockedResource
+--- PASS: TestAcquireUnlockedResource (0.00s)
+=== RUN   TestAcquireActiveResourceBySecondOwnerFails
+--- PASS: TestAcquireActiveResourceBySecondOwnerFails (0.00s)
+=== RUN   TestAcquireActiveResourceBySameOwnerWithDifferentRequestIDFails
+--- PASS: TestAcquireActiveResourceBySameOwnerWithDifferentRequestIDFails (0.00s)
+=== RUN   TestAcquireInputValidation
+--- PASS: TestAcquireInputValidation (0.00s)
+=== RUN   TestAcquireAfterLeaseExpirationAdvancesTokenAndGrants
+--- PASS: TestAcquireAfterLeaseExpirationAdvancesTokenAndGrants (0.00s)
+=== RUN   TestRenewActiveLock
+--- PASS: TestRenewActiveLock (0.00s)
+=== RUN   TestRenewRejections
+--- PASS: TestRenewRejections (0.00s)
+=== RUN   TestRenew_LeaseVersionOverflow
+--- PASS: TestRenew_LeaseVersionOverflow (0.00s)
+=== RUN   TestReleaseActiveLock
+--- PASS: TestReleaseActiveLock (0.00s)
+=== RUN   TestReleaseRejections
+--- PASS: TestReleaseRejections (0.00s)
+=== RUN   TestExpireLock
+--- PASS: TestExpireLock (0.00s)
+=== RUN   TestExpire_StaleCommandRejectedAfterRenewal
+--- PASS: TestExpire_StaleCommandRejectedAfterRenewal (0.00s)
+=== RUN   TestExpire_OldExpirationRejectedWhenRenewalRetainsExactSameExpiryTimestamp
+--- PASS: TestExpire_OldExpirationRejectedWhenRenewalRetainsExactSameExpiryTimestamp (0.00s)
+=== RUN   TestExpire_ValidAfterRenewalExpires
+--- PASS: TestExpire_ValidAfterRenewalExpires (0.00s)
+=== RUN   TestExpire_DifferentLeaseGenerationRejected
+--- PASS: TestExpire_DifferentLeaseGenerationRejected (0.00s)
+=== RUN   TestExpire_RejectedLeavesStateUnchanged
+--- PASS: TestExpire_RejectedLeavesStateUnchanged (0.00s)
+=== RUN   TestExpire_Idempotency
+--- PASS: TestExpire_Idempotency (0.00s)
+=== RUN   TestIdempotencyAcquire
+--- PASS: TestIdempotencyAcquire (0.00s)
+=== RUN   TestIdempotencyRenew
+--- PASS: TestIdempotencyRenew (0.00s)
+=== RUN   TestIdempotencyRelease
+--- PASS: TestIdempotencyRelease (0.00s)
+=== RUN   TestFencingTokensMonotonicityAndIndependence
+--- PASS: TestFencingTokensMonotonicityAndIndependence (0.00s)
+=== RUN   TestFencingTokenOverflowHandling
+--- PASS: TestFencingTokenOverflowHandling (0.00s)
+=== RUN   TestDeterminismAndLogicalTimePolicy
+--- PASS: TestDeterminismAndLogicalTimePolicy (0.00s)
+=== RUN   TestArithmeticOverflow_AcquireTTL
+--- PASS: TestArithmeticOverflow_AcquireTTL (0.00s)
+=== RUN   TestArithmeticOverflow_AcquireTimestamp
+--- PASS: TestArithmeticOverflow_AcquireTimestamp (0.00s)
+=== RUN   TestArithmeticOverflow_RenewTTL
+--- PASS: TestArithmeticOverflow_RenewTTL (0.00s)
+=== RUN   TestInputValidation_TimestampAndTTL
+--- PASS: TestInputValidation_TimestampAndTTL (0.00s)
+=== RUN   TestAtomicity_FailedAcquireLeavesStateUnchanged
+--- PASS: TestAtomicity_FailedAcquireLeavesStateUnchanged (0.00s)
+=== RUN   TestAtomicity_FailedRenewLeavesStateUnchanged
+--- PASS: TestAtomicity_FailedRenewLeavesStateUnchanged (0.00s)
+=== RUN   TestAtomicity_FailedReleaseLeavesStateUnchanged
+--- PASS: TestAtomicity_FailedReleaseLeavesStateUnchanged (0.00s)
+=== RUN   TestLogicalTimePolicy_ValidationVsBusinessFailure
+--- PASS: TestLogicalTimePolicy_ValidationVsBusinessFailure (0.00s)
+PASS
+ok      lockguard/backend/internal/lockstate    0.206s
+```
+
+Race detector validation:
+```powershell
+go test -v -race -count=1 ./internal/lockstate
+# PASS - 0 data races detected
+ok      lockguard/backend/internal/lockstate    1.242s
+```
+
+### 2. Backend Server & Config Verification (`backend/tests`)
 ```
 === RUN   TestDefaultConfig
 --- PASS: TestDefaultConfig (0.00s)
@@ -184,7 +299,41 @@ PASS
 ok      lockguard/backend/tests 0.854s
 ```
 
-### 2. Protected Resource Verification (`protected-resource/internal`)
+### 3. HashiCorp Raft Consensus & Coordinator Verification (`backend/internal/consensus` & `backend/internal/coordinator`)
+```
+=== RUN   TestCluster_ThreeNodeElectionAndReplication
+--- PASS: TestCluster_ThreeNodeElectionAndReplication (0.10s)
+=== RUN   TestCluster_LeaderFailover
+--- PASS: TestCluster_LeaderFailover (0.18s)
+=== RUN   TestCluster_QuorumLoss_FailClosed
+    cluster_test.go:344: Write correctly failed closed without quorum: leadership lost while committing log
+--- PASS: TestCluster_QuorumLoss_FailClosed (0.14s)
+=== RUN   TestCluster_BoltDBPersistenceAndRecovery
+--- PASS: TestCluster_BoltDBPersistenceAndRecovery (0.37s)
+=== RUN   TestCodec_AcquireCommandRoundTrip
+--- PASS: TestCodec_AcquireCommandRoundTrip (0.00s)
+=== RUN   TestCodec_RenewCommandRoundTrip
+--- PASS: TestCodec_RenewCommandRoundTrip (0.00s)
+=== RUN   TestCodec_ReleaseCommandRoundTrip
+--- PASS: TestCodec_ReleaseCommandRoundTrip (0.00s)
+=== RUN   TestCodec_ExpireCommandRoundTrip
+--- PASS: TestCodec_ExpireCommandRoundTrip (0.00s)
+=== RUN   TestCodec_InvalidEnvelopeRejections
+--- PASS: TestCodec_InvalidEnvelopeRejections (0.00s)
+=== RUN   TestLockFSM_ApplyAndSnapshotRestore
+--- PASS: TestLockFSM_ApplyAndSnapshotRestore (0.00s)
+=== RUN   TestRaftNode_SingleNodeAcquireRenewRelease
+--- PASS: TestRaftNode_SingleNodeAcquireRenewRelease (0.06s)
+PASS
+ok      lockguard/backend/internal/consensus    1.476s
+
+=== RUN   TestCoordinatorHandler_AcquireRenewAndRead
+--- PASS: TestCoordinatorHandler_AcquireRenewAndRead (0.07s)
+PASS
+ok      lockguard/backend/internal/coordinator  0.569s
+```
+
+### 4. Protected Resource Verification (`protected-resource/internal`)
 ```
 === RUN   TestRepeatedSameLeaseWrites
 --- PASS: TestRepeatedSameLeaseWrites (0.00s)
@@ -206,22 +355,35 @@ PASS
 ok      lockguard/protected-resource/internal   0.599s
 ```
 
-### 3. Frontend Build Verification (`frontend/`)
+### 5. Frontend Build Verification (`frontend/`)
 ```
 vite v6.4.5 building for production...
-✓ 1664 modules transformed.
-dist/index.html                   0.88 kB │ gzip:  0.50 kB
-dist/assets/index-CgOVcSWx.css   24.32 kB │ gzip:  4.88 kB
-dist/assets/index-DIiHD52j.js   272.20 kB │ gzip: 87.34 kB
-✓ built in 10.29s
+✓ 1669 modules transformed.
+dist/index.html                   0.88 kB │ gzip:  0.51 kB
+dist/assets/index-DpY4_pzL.css   30.09 kB │ gzip:  5.64 kB
+dist/assets/index-XxF6zmhf.js   314.38 kB │ gzip: 94.74 kB
+✓ built in 7.37s
 ```
 
-### 4. Docker Compose Configuration Validation
+### 6. Phase 3 Audit & Persistence Verification (`backend/internal/audit`, `backend/internal/persistence`)
+```
+=== RUN   TestPhase3AuditPersistenceAndPagination
+--- PASS: TestPhase3AuditPersistenceAndPagination (0.12s)
+=== RUN   TestPhase3DatabaseOutageIsolation
+--- PASS: TestPhase3DatabaseOutageIsolation (0.15s)
+=== RUN   TestPhase3DiagnosticsDistinguishesRaftFromDatabase
+--- PASS: TestPhase3DiagnosticsDistinguishesRaftFromDatabase (0.01s)
+=== RUN   TestPhase3AuditSecretRedactionInAPI
+--- PASS: TestPhase3AuditSecretRedactionInAPI (0.00s)
+PASS
+ok      lockguard/backend/tests   1.996s
+```
+
+### 7. Docker Compose Configuration Validation
 ```powershell
 docker compose config
 # Exited with code 0 - All 9 services, 4 volumes, and 2 networks validated successfully.
 ```
-> **Operational Status Distinction:** In Phase 0, Docker Compose has been verified strictly through static configuration and schema validation (`docker compose config`). Containers have **not** yet been started or tested as operational runtime daemons (which is scheduled for integration testing in subsequent phases).
 
 ---
 
@@ -229,28 +391,34 @@ docker compose config
 
 ### Local Quickstart
 
-1. **Start the Go API:**
+1. **Run Full Test Suite (Unit & 9 Integration Scenarios):**
+   ```powershell
+   cd backend
+   go test -v -race -count=1 ./...
+   ```
+
+2. **Run Protected Resource Tests:**
+   ```powershell
+   cd protected-resource
+   go test -v -race -count=1 ./...
+   ```
+
+3. **Start the Go API Gateway:**
    ```powershell
    cd backend
    go run ./cmd/api
    ```
-   Verify at `http://localhost:8080/health`.
+   Verify at `http://localhost:8080/health` and `http://localhost:8080/metrics`.
 
-2. **Start the Frontend Dashboard:**
+4. **Start the Frontend Dashboard:**
    ```powershell
    cd frontend
    npm run dev
    ```
    Open `http://localhost:3000` in your browser.
 
-3. **Or launch the entire cluster with Docker Compose:**
-   ```powershell
-   docker compose up -d --build
-   ```
-
 ---
 
 ## 7. License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-

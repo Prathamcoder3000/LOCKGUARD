@@ -1,12 +1,18 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"time"
 
 	"lockguard/backend/internal/config"
 )
+
+// LeaderChecker defines an interface to query cluster leader accessibility.
+type LeaderChecker interface {
+	GetLeader(ctx context.Context) (string, error)
+}
 
 // HealthResponse represents liveness status.
 type HealthResponse struct {
@@ -45,8 +51,8 @@ func HealthHandler(serviceName, version, nodeID string) http.HandlerFunc {
 	}
 }
 
-// ReadinessHandler checks subsystem readiness (storage accessibility, configuration validity).
-func ReadinessHandler(cfg *config.Config, serviceName, nodeID string) http.HandlerFunc {
+// ReadinessHandler checks subsystem readiness (storage accessibility, configuration validity, coordinator leader reachability).
+func ReadinessHandler(cfg *config.Config, serviceName, nodeID string, checkers ...LeaderChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
@@ -86,6 +92,18 @@ func ReadinessHandler(cfg *config.Config, serviceName, nodeID string) http.Handl
 
 		// Database readiness state
 		components["database"] = "standby_phase0"
+
+		// Check Coordinator Raft Leader Reachability if checker provided
+		if len(checkers) > 0 && checkers[0] != nil {
+			leaderURL, err := checkers[0].GetLeader(r.Context())
+			if err != nil || leaderURL == "" {
+				components["coordinator_cluster"] = "leader_unavailable"
+				allReady = false
+			} else {
+				components["coordinator_cluster"] = "ready"
+				components["leader"] = leaderURL
+			}
+		}
 
 		statusStr := "ready"
 		httpStatus := http.StatusOK
