@@ -23,6 +23,7 @@ const (
 type WriteRequest struct {
 	ResourceName string `json:"resource_name"`
 	FencingToken uint64 `json:"fencing_token"`
+	OwnerID      string `json:"owner_id"`
 	Payload      string `json:"payload"`
 }
 
@@ -61,15 +62,16 @@ func main() {
 			return
 		}
 
-		if req.ResourceName == "" || req.FencingToken == 0 {
-			http.Error(w, `{"error":"resource_name and fencing_token are required"}`, http.StatusBadRequest)
+		if req.ResourceName == "" || req.FencingToken == 0 || req.OwnerID == "" {
+			http.Error(w, `{"error":"resource_name, fencing_token, and owner_id are required"}`, http.StatusBadRequest)
 			return
 		}
 
-		if err := guard.ValidateAndApply(req.ResourceName, req.FencingToken); err != nil {
+		if err := guard.ValidateAndApply(req.ResourceName, req.FencingToken, req.OwnerID); err != nil {
 			logger.Warn("fencing_token_rejected",
 				slog.String("resource", req.ResourceName),
 				slog.Uint64("token", req.FencingToken),
+				slog.String("owner_id", req.OwnerID),
 				slog.String("error", err.Error()),
 			)
 			w.Header().Set("Content-Type", "application/json")
@@ -87,13 +89,15 @@ func main() {
 		logger.Info("fencing_write_accepted",
 			slog.String("resource", req.ResourceName),
 			slog.Uint64("token", req.FencingToken),
+			slog.String("owner_id", req.OwnerID),
 		)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"message": "write committed safely under fencing token verification",
+			"success":       true,
+			"message":       "write committed safely under fencing token verification",
 			"applied_token": req.FencingToken,
+			"owner_id":      req.OwnerID,
 		})
 	})
 

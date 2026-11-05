@@ -79,3 +79,4 @@ func main() {
 
 	logger.Info("service_stopped_cleanly", slog.String("service", ServiceName))
 }
+

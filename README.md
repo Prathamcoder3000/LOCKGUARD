@@ -186,10 +186,24 @@ ok      lockguard/backend/tests 0.854s
 
 ### 2. Protected Resource Verification (`protected-resource/internal`)
 ```
-=== RUN   TestFencingGuardMonotonicity
---- PASS: TestFencingGuardMonotonicity (0.00s)
+=== RUN   TestRepeatedSameLeaseWrites
+--- PASS: TestRepeatedSameLeaseWrites (0.00s)
+=== RUN   TestRejectLowerTokens
+--- PASS: TestRejectLowerTokens (0.00s)
+=== RUN   TestAcceptNewerTokens
+--- PASS: TestAcceptNewerTokens (0.00s)
+=== RUN   TestRejectDifferentOwnerOnSameToken
+--- PASS: TestRejectDifferentOwnerOnSameToken (0.00s)
+=== RUN   TestStaleOwnerAfterNewerTokenAccepted
+--- PASS: TestStaleOwnerAfterNewerTokenAccepted (0.00s)
+=== RUN   TestInputValidation
+--- PASS: TestInputValidation (0.00s)
+=== RUN   TestMultipleIndependentResources
+--- PASS: TestMultipleIndependentResources (0.00s)
+=== RUN   TestConcurrentRequests
+--- PASS: TestConcurrentRequests (0.00s)
 PASS
-ok      lockguard/protected-resource/internal   0.704s
+ok      lockguard/protected-resource/internal   0.599s
 ```
 
 ### 3. Frontend Build Verification (`frontend/`)
@@ -199,14 +213,15 @@ vite v6.4.5 building for production...
 dist/index.html                   0.88 kB │ gzip:  0.50 kB
 dist/assets/index-CgOVcSWx.css   24.32 kB │ gzip:  4.88 kB
 dist/assets/index-DIiHD52j.js   272.20 kB │ gzip: 87.34 kB
-✓ built in 6.27s
+✓ built in 10.29s
 ```
 
-### 4. Docker Compose Verification
+### 4. Docker Compose Configuration Validation
 ```powershell
 docker compose config
 # Exited with code 0 - All 9 services, 4 volumes, and 2 networks validated successfully.
 ```
+> **Operational Status Distinction:** In Phase 0, Docker Compose has been verified strictly through static configuration and schema validation (`docker compose config`). Containers have **not** yet been started or tested as operational runtime daemons (which is scheduled for integration testing in subsequent phases).
 
 ---
 
@@ -238,3 +253,4 @@ docker compose config
 ## 7. License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+

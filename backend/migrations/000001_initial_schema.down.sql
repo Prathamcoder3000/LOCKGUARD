@@ -6,3 +6,4 @@ DROP TABLE IF EXISTS benchmark_runs;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS users;
 DROP TABLE IF EXISTS roles;
+

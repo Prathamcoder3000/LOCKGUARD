@@ -88,3 +88,4 @@ func TestMethodNotAllowedOnHealth(t *testing.T) {
 		t.Errorf("expected status 405 Method Not Allowed, got %d", rr.Code)
 	}
 }
+

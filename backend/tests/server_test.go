@@ -79,3 +79,4 @@ func TestStandardErrorFormatting(t *testing.T) {
 		t.Errorf("expected code %s, got %s", api.ErrCodeBadRequest, errResp.Error.Code)
 	}
 }
+

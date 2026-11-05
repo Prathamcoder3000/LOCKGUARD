@@ -63,3 +63,4 @@ func (p *PostgresDB) Close() error {
 func (p *PostgresDB) DB() *sql.DB {
 	return p.db
 }
+

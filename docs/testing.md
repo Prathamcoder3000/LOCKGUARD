@@ -48,12 +48,14 @@ npm run build
 8. `TestStandardErrorFormatting`: Confirms structured error JSON envelopes adhere to API contracts.
 
 ### Protected Resource Tests (`protected-resource/internal/`)
-1. `TestFencingGuardMonotonicity`: Validates Martin Kleppmann's fencing token algorithm:
-   - Token 100 accepted.
-   - Token 101 accepted.
-   - Stale token 100 rejected with `ErrStaleFencingToken`.
-   - Repeated token 101 rejected with `ErrStaleFencingToken`.
-   - Independent resource namespaces do not collide.
+1. `TestRepeatedSameLeaseWrites`: Verifies that multiple legitimate operations under the same active lease (`token == current.HighestToken` and `owner == current.OwnerID`) are permitted.
+2. `TestRejectLowerTokens`: Verifies that any write carrying a token lower than the highest accepted token is rejected with `ErrStaleFencingToken`.
+3. `TestAcceptNewerTokens`: Confirms that a higher token advances the state and rebinds owner identity.
+4. `TestRejectDifferentOwnerOnSameToken`: Confirms that an unauthorized entity cannot hijack an active token epoch (`ErrOwnerMismatch`).
+5. `TestStaleOwnerAfterNewerTokenAccepted`: Validates that once a newer token is accepted, an older owner can never execute writes (even if it was previously legitimate).
+6. `TestInputValidation`: Confirms empty resource names, empty owners, and zero tokens are rejected.
+7. `TestMultipleIndependentResources`: Verifies isolation between independent named resources.
+8. `TestConcurrentRequests`: Verifies thread safety and race freedom under high concurrency (100 parallel same-lease writers and 50 competing advance operations).
 
 ---
 
@@ -66,3 +68,4 @@ npm run build
 | **Phase 3: Persistence** | Abrupt kill (`SIGKILL`) of leader during active lease. | New leader elected from remaining 2 nodes; lease intact. |
 | **Phase 4: Fault Injection** | Network partition via `iptables` / packet drop. | Minority node immediately fails closed and ceases commits. |
 | **Phase 5: Benchmarking** | Throughput & latency under 10k ops/sec. | P99 latency remains bounded; zero fencing token regressions. |
+

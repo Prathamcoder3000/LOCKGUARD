@@ -109,3 +109,4 @@ func ReadinessHandler(cfg *config.Config, serviceName, nodeID string) http.Handl
 		}
 	}
 }
+

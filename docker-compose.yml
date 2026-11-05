@@ -246,3 +246,4 @@ volumes:
   coordinator_a_data:
   coordinator_b_data:
   coordinator_c_data:
+

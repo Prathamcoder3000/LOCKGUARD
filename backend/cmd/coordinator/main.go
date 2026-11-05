@@ -107,3 +107,4 @@ func main() {
 	}
 	logger.Info("coordinator_stopped", slog.String("node_id", cfg.Raft.NodeID))
 }
+

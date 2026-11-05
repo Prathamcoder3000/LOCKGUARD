@@ -93,3 +93,4 @@ Each coordinator preserves its state independently to prevent accidental shared-
 | `coordinator_b_data` | `/var/lib/lockguard/data` | Node B BoltDB log, stable store, and Raft snapshots |
 | `coordinator_c_data` | `/var/lib/lockguard/data` | Node C BoltDB log, stable store, and Raft snapshots |
 | `postgres_data` | `/var/lib/postgresql/data` | PostgreSQL relational cluster metadata |
+

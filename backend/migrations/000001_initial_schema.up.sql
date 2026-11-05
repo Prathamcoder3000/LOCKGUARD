@@ -102,3 +102,4 @@ VALUES
     ('operator', 'Cluster operations, fault injection, and benchmark runner', '["cluster:view", "cluster:benchmark", "cluster:inject_fault"]'::jsonb),
     ('developer', 'Client application lock consumer and status viewer', '["locks:acquire", "locks:release", "locks:view"]'::jsonb)
 ON CONFLICT (name) DO NOTHING;
+

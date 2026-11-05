@@ -66,3 +66,4 @@ Let $Q_1$ and $Q_2$ be any two majorities of cluster nodes $N = \{A, B, C\}$ ($|
 By the Pigeonhole Principle:
 $$Q_1 \cap Q_2 \neq \emptyset$$
 Therefore, no two leaders can commit divergent states in the same Raft term.
+

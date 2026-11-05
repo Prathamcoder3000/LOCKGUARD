@@ -87,3 +87,4 @@ func TestEnvOverride(t *testing.T) {
 		t.Errorf("expected NodeID 'coordinator-b', got '%s'", cfg.Raft.NodeID)
 	}
 }
+

@@ -75,3 +75,4 @@ curl -X POST http://localhost:8080/api/v1/locks/release \
 | `ERR_NOT_LEADER` | Request sent to a follower coordinator node. | Read the `leader_address` hint in the response and redirect requests directly to the authoritative leader. |
 | `ERR_QUORUM_UNAVAILABLE` | 2 or more coordinator nodes are unreachable. | The cluster has failed closed. Restore connectivity to at least 2 nodes to re-establish quorum. |
 | `ERR_FENCING_TOKEN_STALE` | Lock lease lapsed and another client acquired the resource. | Discard local state and re-acquire a fresh lock. |
+

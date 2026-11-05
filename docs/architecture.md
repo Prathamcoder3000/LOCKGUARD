@@ -124,13 +124,16 @@ A fundamental architectural mandate in LockGuard is the strict separation betwee
 
 ---
 
-## 6. Fencing Token Lifecycle (Kleppmann Invariant)
+## 6. Fencing Token Lifecycle (Kleppmann Invariant & Lease Semantics)
 
 To guard against asynchronous delays, JVM stop-the-world GC pauses, or network delays where an expired lock holder mistakenly executes mutations:
-1. Each lock acquisition increments an atomic **monotonic fencing token** ($T_{k+1} > T_k$).
-2. The client must supply this token with any mutation payload directed to the **Protected Resource**.
-3. The Protected Resource tracks $T_{max} = \max(T_{observed})$.
-4. If a client presents $T_{client} \le T_{max}$, the mutation is rejected with `ERR_FENCING_TOKEN_STALE`.
+1. Each lock acquisition increments an atomic **monotonic fencing token** ($T_{k+1} > T_k$) bound to an authoritative `OwnerID`.
+2. The client supplies both the fencing token and its `OwnerID` with any mutation payload directed to the **Protected Resource**.
+3. The Protected Resource tracks $(T_{accepted}, \text{OwnerID})$ for each resource independently.
+4. **Validation Rules:**
+   - **$T < T_{accepted}$:** Rejected unconditionally as stale (`ERR_FENCING_TOKEN_STALE`).
+   - **$T == T_{accepted}$:** Accepted if and only if `OwnerID` matches the current leaseholder who established this epoch, enabling repeated legitimate writes under the same active lease. If `OwnerID` mismatches, rejected with `ERR_OWNER_MISMATCH`.
+   - **$T > T_{accepted}$:** Accepted as a newer lease epoch; atomically advances $T_{accepted} \leftarrow T$ and assigns `OwnerID`. Stale owners from superseded epochs are permanently barred from writing.
 
 ---
 
@@ -142,3 +145,4 @@ To guard against asynchronous delays, JVM stop-the-world GC pauses, or network d
 - **Phase 3:** BoltDB log storage, automated snapshots, crash recovery, state restoration.
 - **Phase 4:** Protected resource service integration, network fault injection, partition simulation.
 - **Phase 5:** High-throughput benchmarking suite, Prometheus instrumentation, latency profiling.
+
