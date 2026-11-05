@@ -87,6 +87,13 @@ func NewRouter(cfg *config.Config, discovery *LeaderDiscovery, reg *metrics.Regi
 	}
 }
 
+// Close closes all idle HTTP keep-alive connections held by the internal transport.
+func (rt *Router) Close() {
+	if tr, ok := rt.httpClient.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
 // ProxyRequest proxies an incoming HTTP request to the discovered Raft leader.
 func (rt *Router) ProxyRequest(w http.ResponseWriter, r *http.Request) {
 	normPath := normalizeRoutePath(r.URL.Path)

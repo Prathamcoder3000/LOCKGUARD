@@ -6,6 +6,7 @@ import { OverviewPage } from '../pages/OverviewPage';
 import { LocksPage } from '../pages/LocksPage';
 import { ClusterPage } from '../pages/ClusterPage';
 import { AuditPage } from '../pages/AuditPage';
+import { ResiliencePage } from '../pages/ResiliencePage';
 import { BenchmarksPage } from '../pages/BenchmarksPage';
 import { LoginPage } from '../pages/LoginPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
@@ -22,6 +23,7 @@ export const App: React.FC = () => {
           <Route path="/locks" element={<LocksPage />} />
           <Route path="/cluster" element={<ClusterPage />} />
           <Route path="/consensus" element={<ClusterPage />} />
+          <Route path="/resilience" element={<ResiliencePage />} />
           <Route path="/audit" element={<AuditPage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />
           <Route path="/settings" element={<OverviewPage />} />

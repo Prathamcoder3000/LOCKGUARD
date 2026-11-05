@@ -106,10 +106,9 @@ func (p *Pipeline) RecordEvent(ev *Event) bool {
 	}
 
 	p.mu.RLock()
-	isClosed := p.closed
-	p.mu.RUnlock()
+	defer p.mu.RUnlock()
 
-	if isClosed {
+	if p.closed {
 		p.failedCount.Add(1)
 		p.incMetricFailed("pipeline_closed")
 		return false
@@ -162,8 +161,22 @@ func (p *Pipeline) workerLoop() {
 	}
 }
 
+// SetRepository dynamically updates the audit repository under safe concurrency controls.
+func (p *Pipeline) SetRepository(repo persistence.AuditRepository) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.repo = repo
+}
+
+func (p *Pipeline) getRepo() persistence.AuditRepository {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.repo
+}
+
 func (p *Pipeline) flushBatch(batch []*Event) {
-	if len(batch) == 0 || p.repo == nil {
+	repo := p.getRepo()
+	if len(batch) == 0 || repo == nil {
 		return
 	}
 
@@ -189,7 +202,7 @@ func (p *Pipeline) flushBatch(batch []*Event) {
 	for attempt := 0; attempt <= p.cfg.MaxRetries; attempt++ {
 		// Context with timeout for batch write
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		persistedCount, err = p.repo.InsertBatch(ctx, records)
+		persistedCount, err = repo.InsertBatch(ctx, records)
 		cancel()
 
 		if err == nil {

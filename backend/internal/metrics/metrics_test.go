@@ -97,3 +97,149 @@ func TestMetricsRegistry_BoundedCardinalityAndGlobalFencingTokenGauge(t *testing
 	}
 }
 
+func TestMetricsRegistry_Phase3MetricsBoundedCardinality(t *testing.T) {
+	reg := NewRegistry()
+
+	// 1. Audit pipeline metrics
+	reg.IncCounter("lockguard_audit_events_created_total", map[string]string{"event_type": "LOCK_ACQUIRE", "status": "COMMITTED"})
+	reg.IncCounter("lockguard_audit_events_created_total", map[string]string{"event_type": "LOCK_RELEASE", "status": "COMMITTED"})
+	reg.IncCounter("lockguard_audit_events_persisted_total", map[string]string{"status": "success"})
+	reg.IncCounter("lockguard_audit_events_failed_total", map[string]string{"reason": "backpressure_drop"})
+	reg.SetGauge("lockguard_audit_queue_size", nil, 42)
+	reg.SetGauge("lockguard_audit_delivery_latency_seconds", nil, 15)
+
+	// 2. Database persistence & migration metrics
+	reg.SetGauge("lockguard_database_health", nil, 1)
+	reg.SetGauge("lockguard_database_migrations_status", nil, 1)
+	reg.SetGauge("lockguard_database_connections", map[string]string{"state": "open"}, 10)
+	reg.SetGauge("lockguard_database_connections", map[string]string{"state": "in_use"}, 2)
+	reg.SetGauge("lockguard_database_connections", map[string]string{"state": "idle"}, 8)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from metrics handler, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+
+	// Verify required Phase 3 metrics are present in Prometheus output
+	expectedSubstrings := []string{
+		`lockguard_audit_events_created_total{event_type="LOCK_ACQUIRE",status="COMMITTED"} 1`,
+		`lockguard_audit_events_persisted_total{status="success"} 1`,
+		`lockguard_audit_events_failed_total{reason="backpressure_drop"} 1`,
+		`lockguard_audit_queue_size 42`,
+		`lockguard_audit_delivery_latency_seconds 15`,
+		`lockguard_database_health 1`,
+		`lockguard_database_migrations_status 1`,
+		`lockguard_database_connections{state="open"} 10`,
+		`lockguard_database_connections{state="in_use"} 2`,
+		`lockguard_database_connections{state="idle"} 8`,
+	}
+
+	for _, sub := range expectedSubstrings {
+		if !strings.Contains(body, sub) {
+			t.Errorf("expected output to contain %q, but was missing.\nFull output:\n%s", sub, body)
+		}
+	}
+
+	// Verify no high-cardinality labels (resource_id, client_id, event_id, owner_id) are present
+	highCardinalityLabels := []string{"resource_id=", "client_id=", "event_id=", "owner_id=", "fencing_token="}
+	for _, badLabel := range highCardinalityLabels {
+		if strings.Contains(body, badLabel) {
+			t.Errorf("critical cardinality leak detected: metric output contains forbidden label %q", badLabel)
+		}
+	}
+}
+
+func TestMetricsRegistry_Phase4ResilienceMetrics(t *testing.T) {
+	reg := NewRegistry()
+
+	// Update Phase 4 resilience metrics
+	reg.IncChaosTests("COORDINATOR_NETWORK_PARTITION")
+	reg.IncCoordinatorFailures("coord-a")
+	reg.IncLeaderChanges()
+	reg.IncNetworkPartitions("isolated_leader")
+	reg.IncRecoveryAttempts("raft")
+	reg.IncRecoveryFailures("database")
+	reg.IncSnapshotRestore("success")
+	reg.SetQuorumAvailable(true)
+	reg.SetClusterNodesAvailable(3)
+	reg.IncProtectedResourceErrors("stale_fencing_token")
+	reg.SetRecoveryDuration("leader_election", 0.45)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from metrics handler, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+
+	expectedSubstrings := []string{
+		`lockguard_chaos_tests_total{type="COORDINATOR_NETWORK_PARTITION"} 1`,
+		`lockguard_coordinator_failures_total{node_id="coord-a"} 1`,
+		`lockguard_leader_changes_total 1`,
+		`lockguard_network_partitions_total{topology="isolated_leader"} 1`,
+		`lockguard_recovery_attempts_total{subsystem="raft"} 1`,
+		`lockguard_recovery_failures_total{subsystem="database"} 1`,
+		`lockguard_snapshot_restore_total{status="success"} 1`,
+		`lockguard_quorum_available 1`,
+		`lockguard_cluster_nodes_available 3`,
+		`lockguard_protected_resource_errors_total{error_type="stale_fencing_token"} 1`,
+		`lockguard_recovery_duration_seconds{action="leader_election"} 450`,
+	}
+
+	for _, sub := range expectedSubstrings {
+		if !strings.Contains(body, sub) {
+			t.Errorf("expected metric output to contain %q, but was missing.\nFull body:\n%s", sub, body)
+		}
+	}
+
+	// Verify no high cardinality leaks
+	forbidden := []string{"session_id=", "request_id=", "client_id=", "resource_id="}
+	for _, bad := range forbidden {
+		if strings.Contains(body, bad) {
+			t.Errorf("cardinality leak: body contains %q", bad)
+		}
+	}
+}
+
+func TestMetricsRegistry_Phase5SecurityAndPerformanceMetrics(t *testing.T) {
+	reg := NewRegistry()
+
+	reg.IncAuthSuccess("client")
+	reg.IncAuthFailure("invalid_token")
+	reg.IncAuthzDenial("read_only")
+	reg.IncRateLimitExceeded("locks_acquire")
+	reg.IncHTTPRequest("POST", "2xx")
+	reg.SetActiveSessions(12)
+	reg.IncSecurityViolation("cross_client_access_attempt")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reg.Handler().ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+
+	expectedSubstrings := []string{
+		`lockguard_auth_successes_total{role="client"} 1`,
+		`lockguard_auth_failures_total{reason="invalid_token"} 1`,
+		`lockguard_authz_denials_total{role="read_only"} 1`,
+		`lockguard_rate_limit_exceeded_total{endpoint="locks_acquire"} 1`,
+		`lockguard_http_requests_total{method="POST",status_class="2xx"} 1`,
+		`lockguard_active_sessions 12`,
+		`lockguard_security_violations_total{violation_type="cross_client_access_attempt"} 1`,
+	}
+
+	for _, sub := range expectedSubstrings {
+		if !strings.Contains(body, sub) {
+			t.Errorf("expected metric output to contain %q, but was missing.\nFull body:\n%s", sub, body)
+		}
+	}
+}
+

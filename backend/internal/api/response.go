@@ -21,6 +21,8 @@ const (
 	ErrCodeLeaseExpired      = "ERR_LEASE_EXPIRED"
 	ErrCodeFencingTokenStale = "ERR_FENCING_TOKEN_STALE"
 	ErrCodeMethodNotAllowed  = "ERR_METHOD_NOT_ALLOWED"
+	ErrCodeOwnerMismatch     = "ERR_OWNER_MISMATCH"
+	ErrCodeRateLimitExceeded = "ERR_RATE_LIMIT_EXCEEDED"
 )
 
 // APIResponse represents the standard success JSON envelope.

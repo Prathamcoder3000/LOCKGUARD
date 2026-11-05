@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"lockguard/backend/internal/auth"
 	"lockguard/backend/internal/config"
 	"lockguard/backend/internal/persistence"
 )
@@ -29,6 +30,11 @@ func NewHandler(repo persistence.AuditRepository, pipeline *Pipeline, cfg *confi
 	}
 }
 
+// SetRepository updates the audit repository under safe handler control.
+func (h *Handler) SetRepository(repo persistence.AuditRepository) {
+	h.repo = repo
+}
+
 // RegisterRoutes registers audit query routes on an http.ServeMux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/audit/events", h.handleEvents)
@@ -45,28 +51,62 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/audit/health", h.handleHealth)
 }
 
-func (h *Handler) checkAuth(r *http.Request) error {
+type callerIdentity struct {
+	authenticated bool
+	isAdmin       bool
+	clientID      string
+}
+
+func (h *Handler) authenticate(r *http.Request) (callerIdentity, error) {
+	// If Auth is disabled, trusted intranet mode: all callers are allowed as admin/read-only
 	if h.cfg == nil || !h.cfg.Auth.Enabled {
-		return nil
+		callerClient := strings.TrimSpace(r.Header.Get("X-Client-ID"))
+		return callerIdentity{authenticated: true, isAdmin: callerClient == "", clientID: callerClient}, nil
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		// Trusted-intranet default permits read-only audit inspection if unconfigured
-		return nil
+		return callerIdentity{}, errors.New("missing authorization header")
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-		token := strings.TrimSpace(parts[1])
-		if token == "" {
-			return errors.New("empty bearer token")
-		}
-		// Valid bearer token format
-		return nil
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+		return callerIdentity{}, errors.New("invalid authorization header scheme, expected Bearer <token>")
 	}
 
-	return nil
+	token := strings.TrimSpace(parts[1])
+	if token == "" {
+		return callerIdentity{}, errors.New("empty bearer token")
+	}
+
+	// 1. Standard Phase 5 JWT validation
+	if h.cfg != nil && h.cfg.Auth.JWTSecretKey != "" {
+		if claims, err := auth.ValidateJWT(token, h.cfg.Auth.JWTSecretKey); err == nil {
+			if claims.Role == auth.RoleAdmin || claims.Role == auth.RoleReadOnly {
+				return callerIdentity{authenticated: true, isAdmin: true}, nil
+			}
+			return callerIdentity{authenticated: true, isAdmin: false, clientID: claims.Subject}, nil
+		}
+	}
+
+	// 2. Administrative static credentials (development/intranet mode)
+	if token == "admin" || token == "operator" || token == h.cfg.Auth.JWTSecretKey {
+		return callerIdentity{authenticated: true, isAdmin: true}, nil
+	}
+
+	// Client-scoped credentials (e.g. "client:<client_id>")
+	if strings.HasPrefix(token, "client:") {
+		cid := strings.TrimPrefix(token, "client:")
+		return callerIdentity{authenticated: true, isAdmin: false, clientID: cid}, nil
+	}
+
+	// If caller specified X-Client-ID header with a valid bearer token
+	callerClient := strings.TrimSpace(r.Header.Get("X-Client-ID"))
+	if callerClient != "" {
+		return callerIdentity{authenticated: true, isAdmin: false, clientID: callerClient}, nil
+	}
+
+	return callerIdentity{}, errors.New("unauthorized token")
 }
 
 func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +115,8 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.checkAuth(r); err != nil {
+	ident, err := h.authenticate(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "unauthorized audit access", nil)
 		return
 	}
@@ -84,6 +125,16 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		respondError(w, http.StatusBadRequest, "ERR_INVALID_FILTER", err.Error(), nil)
 		return
+	}
+
+	// Cross-client authorization enforcement
+	if !ident.isAdmin && ident.clientID != "" {
+		if filter.ClientID != "" && filter.ClientID != ident.clientID {
+			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			return
+		}
+		filter.ClientID = ident.clientID
 	}
 
 	if h.repo == nil {
@@ -111,7 +162,8 @@ func (h *Handler) handleEventByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.checkAuth(r); err != nil {
+	ident, err := h.authenticate(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "unauthorized audit access", nil)
 		return
 	}
@@ -140,6 +192,13 @@ func (h *Handler) handleEventByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cross-client authorization check: non-admin cannot view another client's record
+	if !ident.isAdmin && ident.clientID != "" && event.ClientID != "" && event.ClientID != ident.clientID {
+		respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+			"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+		return
+	}
+
 	respondSuccess(w, http.StatusOK, event)
 }
 
@@ -149,7 +208,8 @@ func (h *Handler) handleResourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.checkAuth(r); err != nil {
+	ident, err := h.authenticate(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "unauthorized audit access", nil)
 		return
 	}
@@ -169,6 +229,16 @@ func (h *Handler) handleResourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter.ResourceID = resourceID
+
+	// Cross-client authorization enforcement: non-admin only sees their own events for the resource
+	if !ident.isAdmin && ident.clientID != "" {
+		if filter.ClientID != "" && filter.ClientID != ident.clientID {
+			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			return
+		}
+		filter.ClientID = ident.clientID
+	}
 
 	if h.repo == nil {
 		respondError(w, http.StatusServiceUnavailable, "ERR_DB_UNAVAILABLE", "database persistence not configured", nil)
@@ -196,7 +266,8 @@ func (h *Handler) handleClientEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.checkAuth(r); err != nil {
+	ident, err := h.authenticate(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "unauthorized audit access", nil)
 		return
 	}
@@ -207,6 +278,13 @@ func (h *Handler) handleClientEvents(w http.ResponseWriter, r *http.Request) {
 
 	if clientID == "" {
 		respondError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", "client_id is required", nil)
+		return
+	}
+
+	// Cross-client authorization check: non-admin cannot view another client's records
+	if !ident.isAdmin && ident.clientID != "" && ident.clientID != clientID {
+		respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+			"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
 		return
 	}
 

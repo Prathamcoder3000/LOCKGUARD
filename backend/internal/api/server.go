@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"lockguard/backend/internal/audit"
+	"lockguard/backend/internal/auth"
 	"lockguard/backend/internal/config"
 	"lockguard/backend/internal/gateway"
 	"lockguard/backend/internal/heartbeat"
@@ -20,6 +22,7 @@ import (
 	"lockguard/backend/internal/persistence"
 	"lockguard/backend/internal/recovery"
 	"lockguard/backend/internal/renewal"
+	"sync"
 )
 
 // Server encapsulates the API Gateway, client session manager, lease renewal, persistence, and audit subsystems.
@@ -42,6 +45,11 @@ type Server struct {
 	auditPipeline *audit.Pipeline
 	auditHandler  *audit.Handler
 	diagnostics   *recovery.DiagnosticsService
+
+	authService    *auth.Service
+	authMiddleware *auth.Middleware
+	rateLimiter    *middleware.RateLimiter
+	loginLimiter   *middleware.RateLimiter
 }
 
 // ClusterStatusResponse outlines cluster topology and quorum expectations.
@@ -113,29 +121,46 @@ func NewServer(cfg *config.Config, logger *slog.Logger, serviceName, version str
 	auditH := audit.NewHandler(auditRepo, auditPipe, cfg)
 	diagService := recovery.NewDiagnosticsService(cfg.Raft.NodeID, serviceName, discovery, db, migrator, auditPipe)
 
+	adminToken := "admin"
+	if envTok := cfg.Auth.APITokenSalt; envTok != "" {
+		adminToken = envTok
+	}
+	authService := auth.NewService(cfg.Auth.JWTSecretKey, time.Duration(cfg.Auth.JWTExpirationH)*time.Hour, adminToken)
+	authMiddleware := auth.NewMiddleware(authService, metricsReg)
+	rateLimiter := middleware.NewRateLimiter(200.0, 400.0, 10000, metricsReg)
+	loginLimiter := middleware.NewRateLimiter(10.0, 20.0, 1000, metricsReg)
+
 	s := &Server{
-		cfg:           cfg,
-		logger:        logger,
-		mux:           mux,
-		serviceName:   serviceName,
-		version:       version,
-		discovery:     discovery,
-		router:        router,
-		heartbeatMgr:  hbMgr,
-		renewalMgr:    renewalMgr,
-		metricsReg:    metricsReg,
-		db:            db,
-		migrator:      migrator,
-		auditRepo:     auditRepo,
-		auditPipeline: auditPipe,
-		auditHandler:  auditH,
-		diagnostics:   diagService,
+		cfg:            cfg,
+		logger:         logger,
+		mux:            mux,
+		serviceName:    serviceName,
+		version:        version,
+		discovery:      discovery,
+		router:         router,
+		heartbeatMgr:   hbMgr,
+		renewalMgr:     renewalMgr,
+		metricsReg:     metricsReg,
+		db:             db,
+		migrator:       migrator,
+		auditRepo:      auditRepo,
+		auditPipeline:  auditPipe,
+		auditHandler:   auditH,
+		diagnostics:    diagService,
+		authService:    authService,
+		authMiddleware: authMiddleware,
+		rateLimiter:    rateLimiter,
+		loginLimiter:   loginLimiter,
 	}
 
 	s.registerRoutes()
 
-	// Apply middleware stack: Recovery -> CORS -> Logging
+	// Apply production middleware stack: SecurityHeaders -> MaxBodySize (1MB) -> ValidateContentType -> RateLimiting -> RequestLogger -> CORS -> Recovery
 	var handler http.Handler = s.mux
+	handler = middleware.RateLimitMiddleware(rateLimiter, "global")(handler)
+	handler = middleware.ValidateContentType(handler)
+	handler = middleware.MaxBodySize(1 << 20)(handler)
+	handler = middleware.SecurityHeaders(handler)
 	handler = middleware.RequestLogger(logger)(handler)
 	handler = middleware.CORS(handler)
 	handler = middleware.Recovery(logger)(handler)
@@ -152,7 +177,21 @@ func NewServer(cfg *config.Config, logger *slog.Logger, serviceName, version str
 	return s
 }
 
+// AuthService returns the centralized authentication service.
+func (s *Server) AuthService() *auth.Service {
+	return s.authService
+}
+
+// RateLimiter returns the API Gateway rate limiter.
+func (s *Server) RateLimiter() *middleware.RateLimiter {
+	return s.rateLimiter
+}
+
 func (s *Server) registerRoutes() {
+	// Centralized Authentication endpoints
+	s.mux.HandleFunc("/v1/auth/login", s.handleLogin)
+	s.mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
+
 	// Top-level Health & Readiness probes
 	s.mux.HandleFunc("/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
 	s.mux.HandleFunc("/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
@@ -191,9 +230,20 @@ func (s *Server) registerRoutes() {
 	// Phase 3 Audit Query API
 	s.auditHandler.RegisterRoutes(s.mux)
 
-	// Phase 3 Operational Diagnostics
-	s.mux.HandleFunc("/v1/recovery/diagnostics", s.handleDiagnostics)
-	s.mux.HandleFunc("/api/v1/recovery/diagnostics", s.handleDiagnostics)
+	// Phase 3 & Phase 4 Operational Recovery and Diagnostics API
+	recoveryH := recovery.NewHandler(s.diagnostics)
+	recoveryH.RegisterRoutes(s.mux)
+
+	// Phase 5 Admin Endpoints (RBAC protected)
+	adminNodesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		RespondSuccess(w, http.StatusOK, map[string]interface{}{
+			"nodes":         s.cfg.Raft.ClusterNodes,
+			"node_id":       s.cfg.Raft.NodeID,
+			"cluster_state": "HEALTHY",
+		})
+	})
+	s.mux.Handle("/v1/admin/cluster/nodes", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminNodesHandler)))
+	s.mux.Handle("/api/v1/admin/cluster/nodes", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminNodesHandler)))
 }
 
 func (s *Server) stripAPIPrefix(handler interface{}) http.HandlerFunc {
@@ -219,24 +269,113 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
+var recorderPool = sync.Pool{
+	New: func() interface{} {
+		return &responseRecorder{
+			body: new(bytes.Buffer),
+		}
+	},
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+
+	var req auth.LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		RespondError(w, http.StatusBadRequest, ErrCodeBadRequest, "malformed login payload", nil)
+		return
+	}
+
+	resp, err := s.authService.Authenticate(req.Username, req.Password)
+	if err != nil {
+		s.metricsReg.IncAuthFailure("invalid_credentials")
+		RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "invalid username or password", nil)
+		return
+	}
+
+	s.metricsReg.IncAuthSuccess(resp.User.Role)
+	RespondSuccess(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleLockOperation(w http.ResponseWriter, r *http.Request) {
 	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				s.metricsReg.IncSecurityViolation("payload_too_large")
+				RespondError(w, http.StatusRequestEntityTooLarge, "ERR_PAYLOAD_TOO_LARGE", "request body exceeds maximum allowed size (1MB)", nil)
+				return
+			}
+		}
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	rec := &responseRecorder{
-		ResponseWriter: w,
-		statusCode:     http.StatusOK,
-		body:           &bytes.Buffer{},
+	// Security Verification: If Authorization header provided or strict production mode enabled
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" || (s.cfg.Auth.Enabled && s.cfg.Environment == "production") {
+		if authHeader == "" {
+			s.metricsReg.IncAuthFailure("missing_header")
+			RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		claims, err := s.authService.ValidateToken(tokenStr)
+		if err != nil {
+			s.metricsReg.IncAuthFailure("invalid_token")
+			RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, err.Error(), nil)
+			return
+		}
+		s.metricsReg.IncAuthSuccess(claims.Role)
+
+		// RBAC: ReadOnly role cannot execute mutating operations
+		if claims.Role == auth.RoleReadOnly && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+			s.metricsReg.IncAuthzDenial(claims.Role)
+			RespondError(w, http.StatusForbidden, ErrCodeForbidden, "read-only role cannot execute lock mutations", nil)
+			return
+		}
+
+		// Ownership isolation: CLIENT role cannot mutate locks with different owner_id
+		if claims.Role == auth.RoleClient && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+			var payload struct {
+				OwnerID string `json:"owner_id"`
+			}
+			if len(bodyBytes) > 0 {
+				_ = json.Unmarshal(bodyBytes, &payload)
+				if payload.OwnerID != "" && !strings.EqualFold(payload.OwnerID, claims.Subject) {
+					s.metricsReg.IncAuthzDenial(claims.Role)
+					s.metricsReg.IncSecurityViolation("cross_client_lock_access")
+					RespondError(w, http.StatusForbidden, ErrCodeOwnerMismatch, "authenticated identity mismatch with requested owner ID", nil)
+					return
+				}
+			}
+		}
 	}
+
+	rec := recorderPool.Get().(*responseRecorder)
+	rec.ResponseWriter = w
+	rec.statusCode = http.StatusOK
+	rec.body.Reset()
+	defer func() {
+		rec.ResponseWriter = nil
+		recorderPool.Put(rec)
+	}()
 
 	s.router.ProxyRequest(rec, r)
 
-	// Non-blocking asynchronous audit event capture
+	// Non-blocking asynchronous audit event capture:
+	// CRITICAL CONCURRENCY HARDENING: Clone response bytes before defer puts rec back into recorderPool
+	// to eliminate any possibility of data race, stale buffer reuse, or data leakage across concurrent requests!
 	if s.auditPipeline != nil {
-		go s.recordProxyAuditEvent(r, bodyBytes, rec.statusCode, rec.body.Bytes())
+		respCopy := append([]byte(nil), rec.body.Bytes()...)
+		statusCode := rec.statusCode
+		go s.recordProxyAuditEvent(r, bodyBytes, statusCode, respCopy)
 	}
 }
 
@@ -429,6 +568,9 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the HTTP server, renewal manager, audit pipeline, and heartbeat scrubber.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("server_shutting_down", slog.String("service", s.serviceName))
+	if s.router != nil {
+		s.router.Close()
+	}
 	if s.auditPipeline != nil {
 		s.auditPipeline.RecordEvent(&audit.Event{
 			EventType:       audit.TypeSystemShutdown,
@@ -444,7 +586,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.db != nil {
 		_ = s.db.Close()
 	}
-	return s.httpServer.Shutdown(ctx)
+	if s.httpServer != nil {
+		return s.httpServer.Shutdown(ctx)
+	}
+	return nil
+}
+
+// Close gracefully releases server resources and idle network connections.
+func (s *Server) Close() error {
+	return s.Shutdown(context.Background())
 }
 
 // Handler returns the underlying http.Handler (used for testing).
@@ -480,6 +630,35 @@ func (s *Server) Metrics() *metrics.Registry {
 // Database returns the persistence connection pool.
 func (s *Server) Database() *persistence.Database {
 	return s.db
+}
+
+// SetDatabase updates the database handle, migrator, audit repo, and diagnostics references.
+func (s *Server) SetDatabase(db *persistence.Database) {
+	s.db = db
+	if db != nil {
+		s.migrator = persistence.NewMigrator(db)
+		s.auditRepo = persistence.NewPostgresAuditRepo(db)
+		if s.auditHandler != nil {
+			s.auditHandler.SetRepository(s.auditRepo)
+		}
+	} else {
+		s.migrator = nil
+		s.auditRepo = nil
+		if s.auditHandler != nil {
+			s.auditHandler.SetRepository(nil)
+		}
+	}
+	if s.diagnostics != nil {
+		s.diagnostics.SetDatabase(db, s.migrator)
+	}
+}
+
+// SetAuditRepository allows updating or disconnecting the audit repository.
+func (s *Server) SetAuditRepository(repo persistence.AuditRepository) {
+	s.auditRepo = repo
+	if s.auditHandler != nil {
+		s.auditHandler.SetRepository(repo)
+	}
 }
 
 // AuditPipeline returns the active audit event pipeline.

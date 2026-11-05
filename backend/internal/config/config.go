@@ -97,6 +97,10 @@ type RaftConfig struct {
 	SnapshotThreshold   uint64
 	CoordinatorAPIPort  int
 	CoordinatorAPIHost  string
+	EnableTLS           bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSCAFile           string
 }
 
 // StorageConfig defines file paths for durable persistence.
@@ -169,6 +173,10 @@ func LoadConfig() (*Config, error) {
 			SnapshotThreshold:   uint64(getEnvInt("RAFT_SNAPSHOT_THRESHOLD", 8192)),
 			CoordinatorAPIPort:  getEnvInt("COORDINATOR_API_PORT", 8001),
 			CoordinatorAPIHost:  getEnv("COORDINATOR_API_HOST", "0.0.0.0"),
+			EnableTLS:           getEnvBool("RAFT_ENABLE_TLS", false),
+			TLSCertFile:         getEnv("RAFT_TLS_CERT_FILE", ""),
+			TLSKeyFile:          getEnv("RAFT_TLS_KEY_FILE", ""),
+			TLSCAFile:           getEnv("RAFT_TLS_CA_FILE", ""),
 		},
 
 		Storage: StorageConfig{
@@ -273,6 +281,12 @@ func (c *Config) Validate() error {
 		if len(c.Auth.JWTSecretKey) < 32 {
 			errs = append(errs, "JWT_SECRET_KEY must be at least 32 characters in production")
 		}
+		if c.DB.Password == "" || c.DB.Password == "lockguard_password" || c.DB.Password == "password" {
+			errs = append(errs, "production environment requires a secure, non-default DB_PASSWORD")
+		}
+		if c.DB.SSLMode == "disable" {
+			errs = append(errs, "production environment requires secure DB_SSL_MODE (require, verify-ca, or verify-full)")
+		}
 	}
 
 	if len(errs) > 0 {
@@ -280,6 +294,30 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// String implements fmt.Stringer for Config, ensuring sensitive credentials are never logged in plaintext.
+func (c *Config) String() string {
+	return fmt.Sprintf(
+		"Config{Environment:%s, AppName:%s, HTTP:%+v, DB:%s, Auth:%s, Raft:%+v, Storage:%+v, Lease:%+v, Gateway:%+v, Heartbeat:%+v, Renewal:%+v}",
+		c.Environment, c.AppName, c.HTTP, c.DB.String(), c.Auth.String(), c.Raft, c.Storage, c.Lease, c.Gateway, c.Heartbeat, c.Renewal,
+	)
+}
+
+// String implements fmt.Stringer for DBConfig, redacting Password.
+func (db DBConfig) String() string {
+	return fmt.Sprintf(
+		"DBConfig{Host:%s, Port:%d, User:%s, Password:[REDACTED], DBName:%s, SSLMode:%s, MaxOpenConns:%d, MaxIdleConns:%d}",
+		db.Host, db.Port, db.User, db.DBName, db.SSLMode, db.MaxOpenConns, db.MaxIdleConns,
+	)
+}
+
+// String implements fmt.Stringer for AuthConfig, redacting JWTSecretKey and APITokenSalt.
+func (a AuthConfig) String() string {
+	return fmt.Sprintf(
+		"AuthConfig{Enabled:%t, JWTSecretKey:[REDACTED], JWTExpirationH:%d, APITokenSalt:[REDACTED]}",
+		a.Enabled, a.JWTExpirationH,
+	)
 }
 
 func getEnv(key, defaultVal string) string {

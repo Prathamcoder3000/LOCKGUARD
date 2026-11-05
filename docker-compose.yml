@@ -16,7 +16,8 @@ services:
       - ./backend/migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     networks:
       - lockguard-internal
-    # PostgreSQL is deliberately not exposed to the public host by default
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5435}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lockguard_user} -d ${DB_NAME:-lockguard_db}"]
       interval: 5s
@@ -254,9 +255,9 @@ services:
       timeout: 3s
       retries: 3
 
-# ==============================================================================
+# ============================================================================
 # Isolated Networks
-# ==============================================================================
+# ============================================================================
 networks:
   lockguard-internal:
     driver: bridge
@@ -265,12 +266,11 @@ networks:
     driver: bridge
     internal: true
 
-# ==============================================================================
+# ============================================================================
 # Persistent Volumes
-# ==============================================================================
+# ============================================================================
 volumes:
   postgres_data:
   coordinator_a_data:
   coordinator_b_data:
   coordinator_c_data:
-

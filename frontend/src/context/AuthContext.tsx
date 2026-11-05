@@ -37,16 +37,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         localStorage.removeItem('lockguard_token');
         localStorage.removeItem('lockguard_user');
       }
-    } else {
-      // Phase 0: Provide default authenticated operator session for exploration
-      const defaultUser: User = {
-        id: 'usr-admin-01',
-        username: 'cluster-admin',
-        role: 'admin',
-        email: 'admin@lockguard.internal',
-      };
-      setUser(defaultUser);
-      setToken('mock-dev-token-phase-0');
     }
     setIsLoading(false);
   }, []);

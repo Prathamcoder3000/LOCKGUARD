@@ -2,6 +2,8 @@ package recovery
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -58,6 +60,48 @@ func TestDiagnosticsSubsystemsReported(t *testing.T) {
 	}
 	if time.Since(report.Timestamp) > 5*time.Second {
 		t.Error("report timestamp is stale")
+	}
+}
+
+func TestRecoveryEndpoints_DiagnosticsAndHealth(t *testing.T) {
+	diag := NewDiagnosticsService("gw-test", "lockguard-api", nil, nil, nil, nil)
+	h := NewHandler(diag)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	// 1. Diagnostics endpoint returns 503 when quorum lost
+	reqDiag := httptest.NewRequest(http.MethodGet, "/v1/recovery/diagnostics", nil)
+	wDiag := httptest.NewRecorder()
+	mux.ServeHTTP(wDiag, reqDiag)
+
+	if wDiag.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for diagnostics under quorum loss, got %d", wDiag.Code)
+	}
+
+	// 2. Health endpoint returns 503 when quorum lost (fail-closed)
+	reqHealth := httptest.NewRequest(http.MethodGet, "/v1/recovery/health", nil)
+	wHealth := httptest.NewRecorder()
+	mux.ServeHTTP(wHealth, reqHealth)
+
+	if wHealth.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for health under quorum loss, got %d", wHealth.Code)
+	}
+
+	// 3. Cluster and Snapshot endpoints
+	reqCluster := httptest.NewRequest(http.MethodGet, "/v1/recovery/cluster", nil)
+	wCluster := httptest.NewRecorder()
+	mux.ServeHTTP(wCluster, reqCluster)
+
+	if wCluster.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for cluster status, got %d", wCluster.Code)
+	}
+
+	reqSnap := httptest.NewRequest(http.MethodGet, "/v1/recovery/snapshots", nil)
+	wSnap := httptest.NewRecorder()
+	mux.ServeHTTP(wSnap, reqSnap)
+
+	if wSnap.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for snapshot status, got %d", wSnap.Code)
 	}
 }
 

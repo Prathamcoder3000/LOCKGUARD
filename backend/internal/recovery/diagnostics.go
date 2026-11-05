@@ -2,6 +2,9 @@ package recovery
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"time"
 
 	"lockguard/backend/internal/audit"
@@ -66,6 +69,12 @@ func NewDiagnosticsService(
 		migrator:    migrator,
 		pipeline:    pipeline,
 	}
+}
+
+// SetDatabase updates the database and migrator handles for diagnostics inspection.
+func (d *DiagnosticsService) SetDatabase(db *persistence.Database, migrator *persistence.Migrator) {
+	d.db = db
+	d.migrator = migrator
 }
 
 // CollectReport performs context-bounded health checks across all subsystems and derives the overall system status.
@@ -220,5 +229,179 @@ func (d *DiagnosticsService) CollectReport(ctx context.Context) SystemHealthRepo
 		Subsystems:          subsystems,
 		Timestamp:           now,
 	}
+}
+
+// CoordinatorNodeStatus captures health and role for an individual coordinator node.
+type CoordinatorNodeStatus struct {
+	NodeID    string `json:"node_id"`
+	Endpoint  string `json:"endpoint"`
+	Reachable bool   `json:"reachable"`
+	IsLeader  bool   `json:"is_leader"`
+	Role      string `json:"role"`
+}
+
+// ClusterRecoveryReport provides topology and quorum status for recovery diagnostics.
+type ClusterRecoveryReport struct {
+	TotalNodes       int                     `json:"total_nodes"`
+	AvailableNodes   []string                `json:"available_nodes"`
+	CurrentLeaderID  string                  `json:"current_leader_id"`
+	CurrentLeaderURL string                  `json:"current_leader_url"`
+	QuorumAvailable  bool                    `json:"quorum_available"`
+	QuorumState      string                  `json:"quorum_state"` // "ESTABLISHED" or "QUORUM_LOST"
+	Coordinators     []CoordinatorNodeStatus `json:"coordinators"`
+	GeneratedAt      time.Time               `json:"generated_at"`
+}
+
+// SnapshotDiagnosticsReport reports the state of Raft log compaction and snapshot persistence.
+type SnapshotDiagnosticsReport struct {
+	NodeID              string    `json:"node_id"`
+	SnapshotAvailable   bool      `json:"snapshot_available"`
+	LastSnapshotIndex   uint64    `json:"last_snapshot_index"`
+	LastSnapshotTerm    uint64    `json:"last_snapshot_term"`
+	SnapshotThreshold   uint64    `json:"snapshot_threshold"`
+	SnapshotInterval    string    `json:"snapshot_interval"`
+	SafeSnapshotStorage bool      `json:"safe_snapshot_storage"`
+	GeneratedAt         time.Time `json:"generated_at"`
+}
+
+// CollectClusterReport queries coordinator endpoints and derives active quorum and topology state.
+func (d *DiagnosticsService) CollectClusterReport(ctx context.Context) ClusterRecoveryReport {
+	now := time.Now().UTC()
+	report := ClusterRecoveryReport{
+		GeneratedAt: now,
+		QuorumState: "QUORUM_LOST",
+	}
+
+	if d.discovery == nil {
+		return report
+	}
+
+	endpoints := d.discovery.Endpoints()
+	report.TotalNodes = len(endpoints)
+
+	var available []string
+	var coordStatuses []CoordinatorNodeStatus
+	var currentLeaderID string
+	var currentLeaderURL string
+
+	leaderURL, err := d.discovery.GetLeader(ctx)
+	if err == nil && leaderURL != "" {
+		currentLeaderURL = leaderURL
+	}
+
+	client := &http.Client{Timeout: 1 * time.Second}
+
+	for _, ep := range endpoints {
+		status := CoordinatorNodeStatus{
+			Endpoint: ep,
+			Role:     "Unknown",
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep+"/v1/cluster/status", nil)
+		if err == nil {
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				var result struct {
+					Success bool `json:"success"`
+					Data    struct {
+						NodeID   string `json:"node_id"`
+						State    string `json:"state"`
+						IsLeader bool   `json:"is_leader"`
+						LeaderID string `json:"leader_id"`
+					} `json:"data"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&result) == nil && result.Success {
+					status.Reachable = true
+					status.NodeID = result.Data.NodeID
+					status.IsLeader = result.Data.IsLeader
+					status.Role = result.Data.State
+					available = append(available, status.NodeID)
+					if status.IsLeader {
+						currentLeaderID = status.NodeID
+						currentLeaderURL = ep
+					}
+				}
+				_ = resp.Body.Close()
+			} else if resp != nil {
+				_ = resp.Body.Close()
+			}
+		}
+		coordStatuses = append(coordStatuses, status)
+	}
+
+	report.AvailableNodes = available
+	report.Coordinators = coordStatuses
+	report.CurrentLeaderID = currentLeaderID
+	report.CurrentLeaderURL = currentLeaderURL
+
+	// Majority quorum rule for N nodes: threshold = floor(N/2) + 1
+	majorityThreshold := (report.TotalNodes / 2) + 1
+	if len(available) >= majorityThreshold && currentLeaderURL != "" {
+		report.QuorumAvailable = true
+		report.QuorumState = "ESTABLISHED"
+	}
+
+	return report
+}
+
+// CollectSnapshotReport inspects snapshot metadata from the authoritative cluster leader.
+func (d *DiagnosticsService) CollectSnapshotReport(ctx context.Context) SnapshotDiagnosticsReport {
+	now := time.Now().UTC()
+	report := SnapshotDiagnosticsReport{
+		NodeID:              d.nodeID,
+		SnapshotThreshold:   8192,
+		SnapshotInterval:    "120s",
+		SafeSnapshotStorage: true,
+		GeneratedAt:         now,
+	}
+
+	if d.discovery == nil {
+		return report
+	}
+
+	leaderURL, err := d.discovery.GetLeader(ctx)
+	if err != nil || leaderURL == "" {
+		return report
+	}
+
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, leaderURL+"/v1/cluster/status", nil)
+	if err != nil {
+		return report
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return report
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			NodeID        string            `json:"node_id"`
+			AppliedIndex  uint64            `json:"applied_index"`
+			Stats         map[string]string `json:"stats"`
+		} `json:"data"`
+	}
+
+	if json.NewDecoder(resp.Body).Decode(&result) == nil && result.Success {
+		report.SnapshotAvailable = true
+		if snapIdxStr, ok := result.Data.Stats["last_snapshot_index"]; ok {
+			var snapIdx uint64
+			_, _ = fmt.Sscanf(snapIdxStr, "%d", &snapIdx)
+			report.LastSnapshotIndex = snapIdx
+		}
+		if snapTermStr, ok := result.Data.Stats["last_snapshot_term"]; ok {
+			var snapTerm uint64
+			_, _ = fmt.Sscanf(snapTermStr, "%d", &snapTerm)
+			report.LastSnapshotTerm = snapTerm
+		}
+	}
+
+	return report
 }
 

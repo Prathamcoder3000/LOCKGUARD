@@ -30,6 +30,12 @@ type NodeConfig struct {
 	// BootstrapCluster indicates if this node should execute BootstrapCluster if no state exists
 	BootstrapCluster bool
 	BootstrapServers []raft.Server
+
+	// TLS configuration for peer consensus transport
+	EnableTLS   bool
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSCAFile   string
 }
 
 // DefaultNodeConfig returns a safe default configuration for testing or local development.

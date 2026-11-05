@@ -92,17 +92,29 @@ func NewRaftNode(cfg NodeConfig, sm *lockstate.MemoryStateMachine) (*RaftNode, e
 			return nil, fmt.Errorf("failed to resolve advertise address %q: %w", cfg.AdvertiseAddr, err)
 		}
 
-		tcpTrans, err := raft.NewTCPTransportWithLogger(
-			cfg.BindAddr,
-			advAddr,
-			5,
-			10*time.Second,
-			hclogLogger,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TCP transport on %q: %w", cfg.BindAddr, err)
+		if cfg.EnableTLS {
+			tlsConf, err := BuildTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize Raft TLS configuration: %w", err)
+			}
+			stream, err := NewTLSStreamLayer(cfg.BindAddr, advAddr, tlsConf)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create Raft TLS stream layer on %q: %w", cfg.BindAddr, err)
+			}
+			trans = raft.NewNetworkTransportWithLogger(stream, 5, 10*time.Second, hclogLogger)
+		} else {
+			tcpTrans, err := raft.NewTCPTransportWithLogger(
+				cfg.BindAddr,
+				advAddr,
+				5,
+				10*time.Second,
+				hclogLogger,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create TCP transport on %q: %w", cfg.BindAddr, err)
+			}
+			trans = tcpTrans
 		}
-		trans = tcpTrans
 	}
 	node.transport = trans
 
@@ -456,6 +468,16 @@ func (n *RaftNode) Snapshot() error {
 		return ErrNodeClosed
 	}
 	return n.raft.Snapshot().Error()
+}
+
+// LeadershipTransfer initiates a Raft leadership transfer to another peer.
+func (n *RaftNode) LeadershipTransfer() error {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed || n.raft == nil {
+		return ErrNodeClosed
+	}
+	return n.raft.LeadershipTransfer().Error()
 }
 
 // Stats returns the raw Raft engine statistics map.

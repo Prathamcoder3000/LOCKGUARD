@@ -102,6 +102,42 @@ Every audit entry conforms to a structured schema containing sufficient forensic
 Audit logs frequently traverse organizational boundaries for review by operators and compliance auditors. Under LockGuard's security model:
 
 1. **Credential Redaction:** The `Event.Validate()` interceptor recursively sanitizes metadata before enqueueing. Any key containing `session_id`, `token_secret`, `password`, `secret`, or `authorization` is scrubbed to `[REDACTED]`.
-2. **Read-Only Inspection:** The Audit Query API (`GET /v1/audit/events`) is strictly read-only and accepts optional Bearer authentication.
+2. **Authorization & Cross-Client Isolation:**
+   - In production (`Auth.Enabled=true`), all audit endpoints enforce Bearer authentication.
+   - Non-admin client sessions (`client:<client_id>`) can ONLY access audit events belonging to their own `client_id`.
+   - Cross-client queries (e.g. `client-A` attempting to read `/v1/audit/clients/client-B`, `/v1/audit/events?client_id=client-B`, or an event record by ID belonging to `client-B`) are strictly rejected with HTTP 403 `ERR_FORBIDDEN`.
+   - Administrative tokens (`admin`, `operator`, or matching `JWTSecretKey`) possess tenant-wide read authority.
 3. **SQL Injection Defense:** All queries in `PostgresAuditRepo` utilize parameterized SQL placeholders (`$1, $2, ...`) without raw string interpolation.
+
+---
+
+## 5. Failure Scenario Analysis & Durability Accounting
+
+Because Raft consensus maintains strict consistency and fail-closed safety for locks while PostgreSQL operates as an asynchronous operational audit store, system designers must rigorously understand failure modes and the accounting boundary between Raft commitments and audit records.
+
+### 5.1 Failure Scenario Matrix
+
+| Failure Mode | Point of Failure | System Behavior & Invariants | Loss Risk | Mitigation / Recovery Mechanism |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Application Crash After Raft Commit** | Between Raft FSM commit and Gateway audit enqueue | Lock lease is safely committed in Raft BoltDB log and FSM memory. Gateway process terminates before emitting audit event. | Audit event lost | Idempotent reconciliation on startup or replay from Raft log; Raft state remains 100% consistent. |
+| **2. Application Crash After Queue Insertion** | Event resides in in-memory channel queue | Process terminates abruptly (`kill -9`, power loss). In-memory channel buffer is lost. | Unflushed events lost | Graceful shutdown (`SIGTERM`) drains queue; `QueueCapacity` bounded; BoltDB retains consensus truth. |
+| **3. Application Crash During Batch Insert** | During `InsertBatch` transaction in PostgreSQL | PostgreSQL transaction rolls back atomically. In-memory batch was in flight. | Batch lost if process dies before retry | ACID transaction guarantees no partial or corrupted rows are ever persisted. |
+| **4. Database Outage While Queued** | DB network severed or container stopped | Pipeline worker retries `MaxRetries` with exponential backoff and jitter. If outage exceeds retries, `db_insert_failed` metric is incremented. | Backpressure drop after retry exhaustion | Event channel buffers up to 10,000 events; once DB recovers, subsequent batches persist cleanly. |
+| **5. Queue Capacity Exhaustion** | Sustained high throughput during prolonged DB outage | Channel buffer reaches capacity (10,000 items). Incoming events are dropped non-blocking. | Dropped events | Metric `lockguard_audit_events_failed_total{reason="queue_full"}` incremented; Raft lock path NEVER blocks. |
+| **6. Shutdown Timeout** | Graceful shutdown context timeout expires | Flush worker attempts to drain queue within `Shutdown(ctx)` context timeout (e.g., 5s). | Events remaining when context cancelled | Production drains fast via micro-batches; timeout can be tuned in configuration. |
+| **7. Duplicate Retry** | DB commits batch but network ACK drops; flusher retries | Flusher resends identical batch with unique UUID `event_id`s. | Zero duplicate records | Deduplication via `ON CONFLICT (event_id) DO NOTHING` in PostgreSQL; primary key idempotency. |
+
+### 5.2 Mathematical Durability Accounting Invariant
+
+The audit pipeline enforces strict conservation of event counts across the entire lifecycle:
+
+$$\Delta N_{\text{created}} = \Delta N_{\text{persisted}} + \Delta N_{\text{failed}} + \Delta N_{\text{queue}}$$
+
+Where:
+- $N_{\text{created}}$: Total events passed to `RecordEvent` (`lockguard_audit_events_created_total`).
+- $N_{\text{persisted}}$: Total events successfully committed to PostgreSQL (`lockguard_audit_events_persisted_total`).
+- $N_{\text{failed}}$: Total events dropped due to backpressure or unrecoverable DB errors (`lockguard_audit_events_failed_total`).
+- $N_{\text{queue}}$: Current in-memory channel depth (`lockguard_audit_queue_size`).
+
+This metric invariant allows operational dashboards and alerting systems to immediately detect any divergence or drop in audit integrity.
 

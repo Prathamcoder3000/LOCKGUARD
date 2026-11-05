@@ -64,6 +64,9 @@ func (s *MemoryStateMachine) RestoreSnapshot(snap *SnapshotData) error {
 	if snap.Version != CurrentSnapshotVersion {
 		return fmt.Errorf("unsupported snapshot version %d (expected %d): %w", snap.Version, CurrentSnapshotVersion, ErrInvalidCommand)
 	}
+	if snap.LastAppliedUnixNano < 0 {
+		return fmt.Errorf("corrupt snapshot: negative last applied timestamp %d: %w", snap.LastAppliedUnixNano, ErrInternalState)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,6 +77,20 @@ func (s *MemoryStateMachine) RestoreSnapshot(snap *SnapshotData) error {
 		if rs.ResourceName == "" {
 			return fmt.Errorf("corrupt snapshot: empty resource name: %w", ErrInternalState)
 		}
+		if _, duplicate := newResources[rs.ResourceName]; duplicate {
+			return fmt.Errorf("corrupt snapshot: duplicate resource name %q: %w", rs.ResourceName, ErrInternalState)
+		}
+		if rs.ActiveLock != nil {
+			if rs.ActiveLock.ResourceName != "" && rs.ActiveLock.ResourceName != rs.ResourceName {
+				return fmt.Errorf("corrupt snapshot: active lock resource name %q does not match resource %q: %w", rs.ActiveLock.ResourceName, rs.ResourceName, ErrInternalState)
+			}
+			if rs.ActiveLock.FencingToken > rs.HighestToken {
+				return fmt.Errorf("corrupt snapshot: active lock fencing token %d exceeds highest token %d for %q: %w", rs.ActiveLock.FencingToken, rs.HighestToken, rs.ResourceName, ErrInternalState)
+			}
+			if rs.ActiveLock.LeaseVersion == 0 {
+				return fmt.Errorf("corrupt snapshot: active lock lease version is 0 for %q: %w", rs.ResourceName, ErrInternalState)
+			}
+		}
 		cloned := rs.Clone()
 		newResources[cloned.ResourceName] = &cloned
 	}
@@ -83,6 +100,9 @@ func (s *MemoryStateMachine) RestoreSnapshot(snap *SnapshotData) error {
 	for _, ir := range snap.IdempotencyRecords {
 		if ir.RequestID == "" {
 			return fmt.Errorf("corrupt snapshot: empty request ID in idempotency record: %w", ErrInternalState)
+		}
+		if _, duplicate := newIdempotency[ir.RequestID]; duplicate {
+			return fmt.Errorf("corrupt snapshot: duplicate request ID %q in idempotency records: %w", ir.RequestID, ErrInternalState)
 		}
 		clonedResult := ir.Result.Clone()
 		if !clonedResult.Success && clonedResult.Code != "" && clonedResult.Error == nil {

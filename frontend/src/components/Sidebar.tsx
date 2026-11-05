@@ -31,6 +31,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
     { name: 'Distributed Locks', to: '/locks', icon: Lock },
     { name: 'Coordinator Nodes', to: '/cluster', icon: Server, badge: '3 Nodes' },
     { name: 'Consensus & Raft', to: '/consensus', icon: Layers },
+    { name: 'Resilience & Recovery', to: '/resilience', icon: Activity, badge: 'Phase 4' },
     { name: 'Audit & Events', to: '/audit', icon: ScrollText },
     { name: 'Benchmarks & Stress', to: '/benchmarks', icon: BarChart3 },
     { name: 'System Settings', to: '/settings', icon: Settings },

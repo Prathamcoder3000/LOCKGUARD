@@ -59,6 +59,29 @@ func NewRegistry() *Registry {
 	r.registerMeta("lockguard_database_query_errors_total", "counter", "Total database errors encountered during query or transaction execution.")
 	r.registerMeta("lockguard_database_migrations_status", "gauge", "Schema migration completion status (1 = up to date, 0 = pending/error).")
 
+	// Phase 4 Chaos, Fault Tolerance & Resilience metrics
+	r.registerMeta("lockguard_chaos_tests_total", "counter", "Total chaos testing fault injections executed.")
+	r.registerMeta("lockguard_coordinator_failures_total", "counter", "Total coordinator node failure/crash events observed.")
+	r.registerMeta("lockguard_leader_changes_total", "counter", "Total Raft leader transition events observed.")
+	r.registerMeta("lockguard_network_partitions_total", "counter", "Total network partition chaos events executed.")
+	r.registerMeta("lockguard_recovery_attempts_total", "counter", "Total automatic or orchestrated recovery attempts initiated.")
+	r.registerMeta("lockguard_recovery_failures_total", "counter", "Total recovery attempts that failed to restore operational state.")
+	r.registerMeta("lockguard_snapshot_restore_total", "counter", "Total Raft snapshot restoration operations executed.")
+	r.registerMeta("lockguard_quorum_available", "gauge", "Current Raft consensus majority quorum availability (1 = active, 0 = lost).")
+	r.registerMeta("lockguard_cluster_nodes_available", "gauge", "Count of reachable and healthy coordinator nodes in the cluster.")
+	r.registerMeta("lockguard_protected_resource_errors_total", "counter", "Total protected resource validation errors (e.g. stale fencing token).")
+	r.registerMeta("lockguard_recovery_duration_seconds", "gauge", "Elapsed time in seconds for the most recent system recovery action.")
+
+	// Phase 5 Security Hardening, API Protection & Performance metrics
+	r.registerMeta("lockguard_auth_successes_total", "counter", "Total successful client and admin authentications.")
+	r.registerMeta("lockguard_auth_failures_total", "counter", "Total failed authentication attempts by reason.")
+	r.registerMeta("lockguard_authz_denials_total", "counter", "Total authorization denials and role access rejections.")
+	r.registerMeta("lockguard_rate_limit_exceeded_total", "counter", "Total requests rejected under rate-limiting policies.")
+	r.registerMeta("lockguard_http_requests_total", "counter", "Total incoming HTTP requests by method and status class.")
+	r.registerMeta("lockguard_http_request_duration_seconds", "gauge", "Latest measured HTTP request handling duration in seconds.")
+	r.registerMeta("lockguard_active_sessions", "gauge", "Number of currently active registered client heartbeat sessions.")
+	r.registerMeta("lockguard_security_violations_total", "counter", "Total security constraint violations detected.")
+
 	return r
 }
 
@@ -199,6 +222,103 @@ func (r *Registry) AddGauge(name string, labels map[string]string, delta int64) 
 // SetCurrentFencingToken records the highest fencing token as a single global gauge without per-resource labels.
 func (r *Registry) SetCurrentFencingToken(token uint64) {
 	r.SetGauge("lockguard_fencing_token_current", nil, int64(token))
+}
+
+// IncChaosTests records a chaos test execution with bounded fault type label.
+func (r *Registry) IncChaosTests(faultType string) {
+	r.IncCounter("lockguard_chaos_tests_total", map[string]string{"type": faultType})
+}
+
+// IncCoordinatorFailures records a coordinator node failure event.
+func (r *Registry) IncCoordinatorFailures(nodeID string) {
+	r.IncCounter("lockguard_coordinator_failures_total", map[string]string{"node_id": nodeID})
+}
+
+// IncLeaderChanges increments the cluster leader change counter.
+func (r *Registry) IncLeaderChanges() {
+	r.IncCounter("lockguard_leader_changes_total", nil)
+}
+
+// IncNetworkPartitions records a network partition chaos event with topology label.
+func (r *Registry) IncNetworkPartitions(topology string) {
+	r.IncCounter("lockguard_network_partitions_total", map[string]string{"topology": topology})
+}
+
+// IncRecoveryAttempts records a recovery attempt for a specific subsystem.
+func (r *Registry) IncRecoveryAttempts(subsystem string) {
+	r.IncCounter("lockguard_recovery_attempts_total", map[string]string{"subsystem": subsystem})
+}
+
+// IncRecoveryFailures records a failed recovery attempt for a subsystem.
+func (r *Registry) IncRecoveryFailures(subsystem string) {
+	r.IncCounter("lockguard_recovery_failures_total", map[string]string{"subsystem": subsystem})
+}
+
+// IncSnapshotRestore records a snapshot restore event.
+func (r *Registry) IncSnapshotRestore(status string) {
+	r.IncCounter("lockguard_snapshot_restore_total", map[string]string{"status": status})
+}
+
+// SetQuorumAvailable updates the consensus quorum availability gauge (1 = true, 0 = false).
+func (r *Registry) SetQuorumAvailable(available bool) {
+	val := int64(0)
+	if available {
+		val = 1
+	}
+	r.SetGauge("lockguard_quorum_available", nil, val)
+}
+
+// SetClusterNodesAvailable updates the count of active cluster coordinators.
+func (r *Registry) SetClusterNodesAvailable(count int) {
+	r.SetGauge("lockguard_cluster_nodes_available", nil, int64(count))
+}
+
+// IncProtectedResourceErrors records a protected resource validation failure.
+func (r *Registry) IncProtectedResourceErrors(errType string) {
+	r.IncCounter("lockguard_protected_resource_errors_total", map[string]string{"error_type": errType})
+}
+
+// SetRecoveryDuration records the duration in milliseconds of a recovery operation.
+func (r *Registry) SetRecoveryDuration(action string, durationSeconds float64) {
+	r.SetGauge("lockguard_recovery_duration_seconds", map[string]string{"action": action}, int64(durationSeconds*1000))
+}
+
+// IncAuthSuccess records a successful authentication.
+func (r *Registry) IncAuthSuccess(role string) {
+	r.IncCounter("lockguard_auth_successes_total", map[string]string{"role": strings.ToLower(role)})
+}
+
+// IncAuthFailure records an authentication failure.
+func (r *Registry) IncAuthFailure(reason string) {
+	r.IncCounter("lockguard_auth_failures_total", map[string]string{"reason": reason})
+}
+
+// IncAuthzDenial records an unauthorized access attempt.
+func (r *Registry) IncAuthzDenial(role string) {
+	r.IncCounter("lockguard_authz_denials_total", map[string]string{"role": strings.ToLower(role)})
+}
+
+// IncRateLimitExceeded records a rate-limit denial.
+func (r *Registry) IncRateLimitExceeded(endpoint string) {
+	r.IncCounter("lockguard_rate_limit_exceeded_total", map[string]string{"endpoint": endpoint})
+}
+
+// IncHTTPRequest records an incoming HTTP request by method and status class.
+func (r *Registry) IncHTTPRequest(method, statusClass string) {
+	r.IncCounter("lockguard_http_requests_total", map[string]string{
+		"method":       strings.ToUpper(method),
+		"status_class": statusClass,
+	})
+}
+
+// SetActiveSessions records the current count of active client sessions.
+func (r *Registry) SetActiveSessions(count int64) {
+	r.SetGauge("lockguard_active_sessions", nil, count)
+}
+
+// IncSecurityViolation records an application security constraint violation.
+func (r *Registry) IncSecurityViolation(violationType string) {
+	r.IncCounter("lockguard_security_violations_total", map[string]string{"violation_type": violationType})
 }
 
 // Handler returns an http.Handler that emits Prometheus exposition format text.

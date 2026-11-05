@@ -3,7 +3,6 @@ package persistence
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"embed"
 	"encoding/hex"
 	"fmt"
@@ -60,24 +59,33 @@ func (m *Migrator) RunMigrations(ctx context.Context) error {
 		return ErrDBUnavailable
 	}
 
-	// 1. Acquire advisory lock to prevent concurrent application instances from running migrations
+	// 1. Acquire dedicated connection from pool so session-level advisory locks
+	// are guaranteed to be acquired and released on the exact same backend connection.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: failed to obtain dedicated connection for migration: %v", ErrMigrationFailed, err)
+	}
+	defer conn.Close()
+
+	// 2. Acquire advisory lock on this specific connection session
 	var lockAcquired bool
-	err := db.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1);", AdvisoryLockKey).Scan(&lockAcquired)
+	err = conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1);", AdvisoryLockKey).Scan(&lockAcquired)
 	if err != nil {
 		return fmt.Errorf("%w: failed to request advisory lock: %v", ErrMigrationFailed, err)
 	}
 	if !lockAcquired {
 		// Wait with context timeout for lock if another instance is holding it
-		_, err = db.ExecContext(ctx, "SELECT pg_advisory_lock($1);", AdvisoryLockKey)
+		_, err = conn.ExecContext(ctx, "SELECT pg_advisory_lock($1);", AdvisoryLockKey)
 		if err != nil {
 			return fmt.Errorf("%w: failed to acquire advisory lock: %v", ErrMigrationFailed, err)
 		}
 	}
 	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1);", AdvisoryLockKey)
+		// Explicitly unlock on the exact same connection session
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1);", AdvisoryLockKey)
 	}()
 
-	// 2. Ensure schema_migrations table exists
+	// 3. Ensure schema_migrations table exists
 	initSQL := `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INT PRIMARY KEY,
@@ -86,13 +94,13 @@ func (m *Migrator) RunMigrations(ctx context.Context) error {
 			checksum VARCHAR(64) NOT NULL
 		);
 	`
-	if _, err := db.ExecContext(ctx, initSQL); err != nil {
+	if _, err := conn.ExecContext(ctx, initSQL); err != nil {
 		return fmt.Errorf("%w: failed to ensure schema_migrations table: %v", ErrMigrationFailed, err)
 	}
 
-	// 3. Load applied migrations from database
+	// 4. Load applied migrations from database
 	applied := make(map[int]MigrationInfo)
-	rows, err := db.QueryContext(ctx, "SELECT version, name, applied_at, checksum FROM schema_migrations;")
+	rows, err := conn.QueryContext(ctx, "SELECT version, name, applied_at, checksum FROM schema_migrations;")
 	if err != nil {
 		return fmt.Errorf("%w: failed to query applied migrations: %v", ErrMigrationFailed, err)
 	}
@@ -110,13 +118,13 @@ func (m *Migrator) RunMigrations(ctx context.Context) error {
 		return fmt.Errorf("%w: applied migrations rows error: %v", ErrMigrationFailed, err)
 	}
 
-	// 4. Discover and sort embedded migration files
+	// 5. Discover and sort embedded migration files
 	files, err := m.loadMigrationFiles()
 	if err != nil {
 		return err
 	}
 
-	// 5. Verify checksums and apply pending migrations
+	// 6. Verify checksums and apply pending migrations
 	for _, mf := range files {
 		if existing, ok := applied[mf.version]; ok {
 			// Verify checksum matches
@@ -129,24 +137,28 @@ func (m *Migrator) RunMigrations(ctx context.Context) error {
 			continue
 		}
 
-		// Apply new migration in transaction
-		err := m.db.WithTx(ctx, func(tx *sql.Tx) error {
-			if _, err := tx.ExecContext(ctx, string(mf.content)); err != nil {
-				return fmt.Errorf("migration %d (%s) execution failed: %w", mf.version, mf.name, err)
-			}
-
-			insertSQL := `
-				INSERT INTO schema_migrations (version, name, applied_at, checksum)
-				VALUES ($1, $2, $3, $4);
-			`
-			if _, err := tx.ExecContext(ctx, insertSQL, mf.version, mf.name, time.Now().UTC(), mf.checksum); err != nil {
-				return fmt.Errorf("recording migration %d failed: %w", mf.version, err)
-			}
-			return nil
-		})
-
+		// Apply new migration in transaction on the dedicated connection
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrMigrationFailed, err)
+			return fmt.Errorf("%w: failed to begin migration transaction: %v", ErrMigrationFailed, err)
+		}
+
+		if _, err := tx.ExecContext(ctx, string(mf.content)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: migration %d (%s) execution failed: %v", ErrMigrationFailed, mf.version, mf.name, err)
+		}
+
+		insertSQL := `
+			INSERT INTO schema_migrations (version, name, applied_at, checksum)
+			VALUES ($1, $2, $3, $4);
+		`
+		if _, err := tx.ExecContext(ctx, insertSQL, mf.version, mf.name, time.Now().UTC(), mf.checksum); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("%w: recording migration %d failed: %v", ErrMigrationFailed, mf.version, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("%w: committing migration %d failed: %v", ErrMigrationFailed, mf.version, err)
 		}
 	}
 
