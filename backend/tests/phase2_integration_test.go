@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -779,7 +780,7 @@ func TestScenarioI_GatewayRestartClearsInMemorySessions(t *testing.T) {
 	}
 
 	// Simulate Gateway Shutdown
-	_ = gw1.Shutdown(t.Context())
+	_ = gw1.Shutdown(context.Background())
 
 	// Gateway Instance 2 (Simulated restart)
 	gw2 := api.NewServer(cfg, logger, "lockguard-gateway", "0.2.0")

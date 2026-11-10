@@ -8,6 +8,7 @@ import { ClusterPage } from '../pages/ClusterPage';
 import { AuditPage } from '../pages/AuditPage';
 import { ResiliencePage } from '../pages/ResiliencePage';
 import { BenchmarksPage } from '../pages/BenchmarksPage';
+import { SettingsPage } from '../pages/SettingsPage';
 import { LoginPage } from '../pages/LoginPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 
@@ -26,7 +27,7 @@ export const App: React.FC = () => {
           <Route path="/resilience" element={<ResiliencePage />} />
           <Route path="/audit" element={<AuditPage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />
-          <Route path="/settings" element={<OverviewPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="/404" element={<NotFoundPage />} />
           <Route path="*" element={<Navigate to="/404" replace />} />
         </Route>

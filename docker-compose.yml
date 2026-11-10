@@ -167,7 +167,7 @@ services:
     networks:
       - lockguard-internal
     ports:
-      - "8080:8080"
+      - "${API_HOST_PORT:-8082}:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
@@ -207,7 +207,7 @@ services:
     networks:
       - lockguard-internal
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -231,7 +231,7 @@ services:
     networks:
       - lockguard-internal
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/gateway/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/gateway/health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3

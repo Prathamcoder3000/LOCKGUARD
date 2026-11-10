@@ -134,7 +134,13 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
 			return
 		}
+		if filter.OwnerID != "" && filter.OwnerID != ident.clientID {
+			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			return
+		}
 		filter.ClientID = ident.clientID
+		filter.OwnerID = ident.clientID
 	}
 
 	if h.repo == nil {
@@ -237,7 +243,13 @@ func (h *Handler) handleResourceEvents(w http.ResponseWriter, r *http.Request) {
 				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
 			return
 		}
+		if filter.OwnerID != "" && filter.OwnerID != ident.clientID {
+			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			return
+		}
 		filter.ClientID = ident.clientID
+		filter.OwnerID = ident.clientID
 	}
 
 	if h.repo == nil {
@@ -294,6 +306,7 @@ func (h *Handler) handleClientEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter.ClientID = clientID
+	filter.OwnerID = clientID
 
 	if h.repo == nil {
 		respondError(w, http.StatusServiceUnavailable, "ERR_DB_UNAVAILABLE", "database persistence not configured", nil)

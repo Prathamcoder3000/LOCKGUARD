@@ -35,7 +35,7 @@ export const OverviewPage: React.FC = () => {
       if (c.status === 'fulfilled') setClusterInfo(c.value);
 
       if (h.status === 'rejected' && r.status === 'rejected') {
-        setError('Backend API is currently unreachable. Start the backend service via "go run ./cmd/api".');
+        setError('Backend API is currently unreachable. Check container health or network configuration.');
       }
       setLastUpdated(new Date().toLocaleTimeString());
     } catch (err: unknown) {
@@ -58,7 +58,7 @@ export const OverviewPage: React.FC = () => {
             Cluster Overview &amp; Coordination State
           </h1>
           <p className="text-sm text-slate-500">
-            LockGuard Fault-Tolerant Distributed Coordination Service • Phase 0 Foundation
+            LockGuard Fault-Tolerant Distributed Coordination Service • Active Consensus
           </p>
         </div>
         <div className="flex items-center space-x-3">
@@ -87,7 +87,7 @@ export const OverviewPage: React.FC = () => {
               <p className="font-semibold">Backend Service Standby</p>
               <p className="mt-0.5 text-amber-700">{error}</p>
               <div className="mt-2 rounded bg-amber-100/70 px-3 py-1.5 font-mono text-xs text-amber-900">
-                Command: cd backend &amp;&amp; go run ./cmd/api
+                Service: lockguard-api (Docker Gateway on port 8080 / Nginx 80)
               </div>
             </div>
           </div>
@@ -163,7 +163,7 @@ export const OverviewPage: React.FC = () => {
           <div className="flex items-center justify-between border-b border-slate-100 pb-4">
             <div>
               <h2 className="text-base font-semibold text-slate-900">Coordinator Cluster Topology</h2>
-              <p className="text-xs text-slate-500">Planned 3-node Raft consensus group configuration</p>
+              <p className="text-xs text-slate-500">Specification Architecture • View Cluster tab for live dynamic telemetry</p>
             </div>
             <span className="inline-flex items-center rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-medium text-blue-700">
               Raft v1.7 Specification
@@ -229,21 +229,24 @@ export const OverviewPage: React.FC = () => {
 
         {/* Subsystems & Implementation Roadmap */}
         <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-card">
-          <div className="flex items-center space-x-2 border-b border-slate-100 pb-4">
-            <Layers className="h-4 w-4 text-blue-600" />
-            <h2 className="text-base font-semibold text-slate-900">Subsystem Architecture</h2>
+          <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+            <div className="flex items-center space-x-2">
+              <Layers className="h-4 w-4 text-blue-600" />
+              <h2 className="text-base font-semibold text-slate-900">Subsystem Architecture Milestones</h2>
+            </div>
+            <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">Phase 0–6 Status</span>
           </div>
 
           <div className="mt-4 space-y-3">
             {[
               { name: 'Monorepo & Base Probes', phase: 'Phase 0', status: 'Verified', color: 'emerald' },
-              { name: 'Raft Consensus Engine', phase: 'Phase 1', status: 'Planned', color: 'slate' },
-              { name: 'Replicated State Machine', phase: 'Phase 1', status: 'Planned', color: 'slate' },
-              { name: 'Lease & Fencing Manager', phase: 'Phase 2', status: 'Planned', color: 'slate' },
-              { name: 'Durable Snapshots & Log Store', phase: 'Phase 3', status: 'Planned', color: 'slate' },
-              { name: 'Protected Resource Service', phase: 'Phase 4', status: 'Planned', color: 'slate' },
-              { name: 'Fault Injection Engine', phase: 'Phase 4', status: 'Planned', color: 'slate' },
-              { name: 'Distributed Benchmarking', phase: 'Phase 5', status: 'Planned', color: 'slate' },
+              { name: 'Deterministic Lock State Machine', phase: 'Phase 1A', status: 'Verified', color: 'emerald' },
+              { name: '3-Node HashiCorp Raft Consensus', phase: 'Phase 1B', status: 'Verified', color: 'emerald' },
+              { name: 'Gateway, Sessions & Auto-Renewal', phase: 'Phase 2', status: 'Verified', color: 'emerald' },
+              { name: 'PostgreSQL Audit & Snapshots', phase: 'Phase 3', status: 'Verified', color: 'emerald' },
+              { name: 'Protected Resource & Chaos Recovery', phase: 'Phase 4', status: 'Verified', color: 'emerald' },
+              { name: 'Security Hardening & RBAC (HS256)', phase: 'Phase 5', status: 'Verified', color: 'emerald' },
+              { name: 'End-to-End Validation & Handover', phase: 'Phase 6', status: 'Verified', color: 'emerald' },
             ].map((subsystem) => (
               <div key={subsystem.name} className="flex items-center justify-between text-xs">
                 <div>

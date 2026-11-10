@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    actor ClientA as Stale Client A
+    actor ClientB as New Client B
+    participant LG as LockGuard Cluster
+    participant PR as Protected Resource Service
+    participant Storage as Protected Storage / Database
+
+    ClientA->>LG: Acquire("critical-record")
+    LG-->>ClientA: Granted (FencingToken=4, TTL=10s)
+    
+    Note over ClientA: GC Pause / Network Partition / CPU Stall (>10s)
+    Note over LG: Lock expires due to heartbeat / lease timeout
+
+    ClientB->>LG: Acquire("critical-record")
+    LG-->>ClientB: Granted (FencingToken=5, TTL=10s)
+
+    ClientB->>PR: POST /mutate {token: 5, data: "Update B"}
+    Note over PR: Check token (5) > highest_seen (0)
+    PR->>Storage: Apply Update B
+    PR->>PR: Record highest_seen = 5
+    PR-->>ClientB: HTTP 200 OK (Mutated)
+
+    Note over ClientA: Client A wakes up from stall (believes it owns lock)
+    ClientA->>PR: POST /mutate {token: 4, data: "Update A"}
+    Note over PR: Check token (4) <= highest_seen (5)
+    Note over PR: STALE FENCING TOKEN DETECTED!
+    PR--xStorage: Reject Mutation (Prevent Data Corruption)
+    PR-->>ClientA: HTTP 409 Conflict {error: "ERR_STALE_FENCING_TOKEN", max_token: 5}
+

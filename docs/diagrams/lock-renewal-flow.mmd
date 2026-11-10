@@ -1,0 +1,24 @@
+sequenceDiagram
+    autonumber
+    actor Client as Worker Client
+    participant RenMgr as Renewal Manager / Gateway
+    participant Leader as Raft Leader
+    participant Quorum as Raft Majority Quorum
+    participant FSM as Deterministic FSM
+
+    Note over Client,RenMgr: Active Lock: FencingToken = T, LeaseVersion = V
+    Client->>RenMgr: POST /v1/locks/renew {resource, owner_id, fencing_token: T, ttl}
+    
+    RenMgr->>Leader: Proxy Renew Request to Authoritative Leader
+    Note over Leader: Validate active leader term
+
+    Leader->>Quorum: Replicate RenewLockCommand across Raft log
+    Quorum-->>Leader: Majority Acknowledgment (Quorum 2/3)
+
+    Leader->>FSM: Apply Renew Command to FSM
+    Note over FSM: 1. Verify Resource Exists & Active<br/>2. Match Owner ID == Active Owner<br/>3. Verify fencing_token == Active Token T<br/>4. Extend Expiry: now + TTL<br/>5. Exact Increment: LeaseVersion = V + 1<br/>6. FencingToken T REMAINS UNCHANGED
+
+    FSM-->>Leader: Success Result {fencing_token: T, lease_version: V+1}
+    Leader-->>RenMgr: HTTP 200 OK
+    RenMgr-->>Client: HTTP 200 OK {fencing_token: T, lease_version: V+1, expires_at}
+

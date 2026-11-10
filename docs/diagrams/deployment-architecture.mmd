@@ -1,0 +1,50 @@
+graph TB
+    subgraph External_Network ["External Clients & Management"]
+        Browser["React Dashboard / Frontend<br/>(Port 3000)"]
+        ClientApp["Distributed Client App<br/>(SDK / HTTP)"]
+    end
+
+    subgraph Edge_Tier ["Edge / Gateway Tier"]
+        GW["API Gateway<br/>(Port 8080)<br/>Reverse Proxy, Auth, Rate Limit, Metrics"]
+    end
+
+    subgraph Consensus_Tier ["Distributed Consensus Tier (Raft Cluster)"]
+        direction LR
+        N1["Coordinator Node 1<br/>HTTP: 8001 | Raft: 9001<br/>Leader / Follower"]
+        N2["Coordinator Node 2<br/>HTTP: 8002 | Raft: 9002<br/>Leader / Follower"]
+        N3["Coordinator Node 3<br/>HTTP: 8003 | Raft: 9003<br/>Leader / Follower"]
+        
+        N1 <===>|"Raft mTLS / RPC"| N2
+        N2 <===>|"Raft mTLS / RPC"| N3
+        N3 <===>|"Raft mTLS / RPC"| N1
+    end
+
+    subgraph Storage_Tier ["Persistence & Infrastructure Tier"]
+        PG[("PostgreSQL 16<br/>Port 5435 (Host) / 5432<br/>Operational Audit Store")]
+        PR["Protected Resource Service<br/>Port 9000<br/>Fencing Token Enforcement"]
+    end
+
+    subgraph Observability_Tier ["Observability & Metrics Tier"]
+        Prom["Prometheus Server<br/>Port 9090"]
+        Graf["Grafana Dashboard<br/>Port 3001"]
+        Prom --> Graf
+    end
+
+    Browser -->|"HTTP / REST"| GW
+    ClientApp -->|"HTTP / REST"| GW
+    
+    GW -->|"Internal Forwarding"| N1
+    GW -->|"Internal Forwarding"| N2
+    GW -->|"Internal Forwarding"| N3
+
+    N1 -.->|"Async Audit Flush"| PG
+    N2 -.->|"Async Audit Flush"| PG
+    N3 -.->|"Async Audit Flush"| PG
+
+    ClientApp -->|"Mutate (with Fencing Token)"| PR
+    
+    Prom -.->|"Scrape /metrics"| GW
+    Prom -.->|"Scrape /metrics"| N1
+    Prom -.->|"Scrape /metrics"| N2
+    Prom -.->|"Scrape /metrics"| N3
+

@@ -7,31 +7,31 @@ interface NodeStatusProps {
 }
 
 export const NodeStatus: React.FC<NodeStatusProps> = ({ coordinators }) => {
-  // If coordinators list is empty (e.g. single coordinator mode or mock fallback), provide default 3-node view
+  // When coordinators list is not yet loaded, show neutral connecting state rather than hardcoding a leader
   const displayNodes: CoordinatorNodeStatus[] =
     coordinators && coordinators.length > 0
       ? coordinators
       : [
           {
             node_id: 'coordinator-a',
-            endpoint: 'http://localhost:8001',
-            reachable: true,
-            is_leader: true,
-            role: 'Leader',
+            endpoint: 'http://coordinator-a:8001',
+            reachable: false,
+            is_leader: false,
+            role: 'Probing...',
           },
           {
             node_id: 'coordinator-b',
-            endpoint: 'http://localhost:8002',
-            reachable: true,
+            endpoint: 'http://coordinator-b:8001',
+            reachable: false,
             is_leader: false,
-            role: 'Follower',
+            role: 'Probing...',
           },
           {
             node_id: 'coordinator-c',
-            endpoint: 'http://localhost:8003',
-            reachable: true,
+            endpoint: 'http://coordinator-c:8001',
+            reachable: false,
             is_leader: false,
-            role: 'Follower',
+            role: 'Probing...',
           },
         ];
 

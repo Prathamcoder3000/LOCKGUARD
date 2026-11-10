@@ -12,6 +12,7 @@ import {
   XCircle,
   Timer,
   KeyRound,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   clusterService,
@@ -19,8 +20,13 @@ import {
   ClientSession,
   RenewalStatus,
 } from '../services/clusterService';
+import { useAuth } from '../context/AuthContext';
 
 export const LocksPage: React.FC = () => {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'ADMIN';
+  const currentOwnerID = user?.owner_id || '';
+
   const [locks, setLocks] = useState<LockRecord[]>([]);
   const [sessions, setSessions] = useState<ClientSession[]>([]);
   const [renewals, setRenewals] = useState<RenewalStatus[]>([]);
@@ -34,16 +40,28 @@ export const LocksPage: React.FC = () => {
   // Acquire Lock Form
   const [acquireForm, setAcquireForm] = useState({
     resource_name: '',
-    owner_id: '',
+    owner_id: currentOwnerID,
     ttl_seconds: 15,
   });
 
   // Register Client Form
   const [registerForm, setRegisterForm] = useState({
-    client_id: '',
-    owner_id: '',
+    client_id: currentOwnerID ? `client-${currentOwnerID}` : '',
+    owner_id: currentOwnerID,
     ttl_seconds: 30,
   });
+
+  // Update modal form defaults when user changes
+  useEffect(() => {
+    if (currentOwnerID) {
+      setAcquireForm((prev) => ({ ...prev, owner_id: currentOwnerID }));
+      setRegisterForm((prev) => ({
+        ...prev,
+        client_id: prev.client_id || `client-${currentOwnerID}`,
+        owner_id: currentOwnerID,
+      }));
+    }
+  }, [currentOwnerID]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -72,9 +90,14 @@ export const LocksPage: React.FC = () => {
   const handleAcquire = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await clusterService.acquireLock(acquireForm);
+      const payload = {
+        ...acquireForm,
+        // For non-admin, strictly enforce own bound owner_id
+        owner_id: !isAdmin && currentOwnerID ? currentOwnerID : acquireForm.owner_id,
+      };
+      await clusterService.acquireLock(payload);
       setShowAcquireModal(false);
-      setAcquireForm({ resource_name: '', owner_id: '', ttl_seconds: 15 });
+      setAcquireForm({ resource_name: '', owner_id: currentOwnerID, ttl_seconds: 15 });
       fetchData();
     } catch (err: any) {
       alert(`Acquire Lock Failed: ${err?.response?.data?.error?.message || err.message}`);
@@ -82,6 +105,19 @@ export const LocksPage: React.FC = () => {
   };
 
   const handleRelease = async (lock: LockRecord) => {
+    const isOwner = currentOwnerID !== '' && lock.owner_id === currentOwnerID;
+
+    if (isAdmin && !isOwner) {
+      if (!confirm(`ADMIN EMERGENCY UNLOCK: Force break active lease on "${lock.resource_name}" held by "${lock.owner_id}"?`)) return;
+      try {
+        await clusterService.adminEmergencyUnlock(lock.resource_name);
+        fetchData();
+      } catch (err: any) {
+        alert(`Emergency Unlock Failed: ${err?.response?.data?.error?.message || err.message}`);
+      }
+      return;
+    }
+
     if (!confirm(`Release lock on "${lock.resource_name}" held by "${lock.owner_id}"?`)) return;
     try {
       await clusterService.releaseLock({
@@ -98,9 +134,17 @@ export const LocksPage: React.FC = () => {
   const handleRegisterClient = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await clusterService.registerClient(registerForm);
+      const payload = {
+        ...registerForm,
+        owner_id: !isAdmin && currentOwnerID ? currentOwnerID : registerForm.owner_id,
+      };
+      await clusterService.registerClient(payload);
       setShowRegisterModal(false);
-      setRegisterForm({ client_id: '', owner_id: '', ttl_seconds: 30 });
+      setRegisterForm({
+        client_id: currentOwnerID ? `client-${currentOwnerID}` : '',
+        owner_id: currentOwnerID,
+        ttl_seconds: 30,
+      });
       fetchData();
     } catch (err: any) {
       alert(`Client Registration Failed: ${err?.response?.data?.error?.message || err.message}`);
@@ -117,17 +161,30 @@ export const LocksPage: React.FC = () => {
   };
 
   const handleStartRenewal = async (lock: LockRecord) => {
-    // Look up an active session for this owner or default client
+    // Look up an active session for this lock owner
     const matchingSession = sessions.find((s) => s.owner_id === lock.owner_id && s.active);
-    const clientID = matchingSession ? matchingSession.client_id : `client-${lock.owner_id}`;
-    const sessionID = matchingSession ? matchingSession.session_id : 'standalone-session';
+
+    if (!matchingSession) {
+      const registerNow = confirm(
+        `No active heartbeat session found for owner "${lock.owner_id}". A live session is required for automatic lease renewal. Would you like to register one now?`
+      );
+      if (registerNow) {
+        setRegisterForm({
+          client_id: `client-${lock.owner_id}`,
+          owner_id: lock.owner_id,
+          ttl_seconds: 30,
+        });
+        setShowRegisterModal(true);
+      }
+      return;
+    }
 
     try {
       await clusterService.startRenewal({
         resource_name: lock.resource_name,
         owner_id: lock.owner_id,
-        client_id: clientID,
-        session_id: sessionID,
+        client_id: matchingSession.client_id,
+        session_id: matchingSession.session_id,
         fencing_token: lock.fencing_token,
         lease_version: lock.lease_version,
         expires_at_unix_nano: lock.expires_at_unix_nano,
@@ -155,7 +212,7 @@ export const LocksPage: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900">Distributed Lock Manager</h1>
           <p className="text-sm text-slate-500">
-            Phase 2: Transparent Raft Gateway, Heartbeat Sessions &amp; Automated Renewal Workers
+            Authoritative Raft Consensus Leases, Heartbeat Sessions &amp; Automated Renewal Workers
           </p>
         </div>
         <div className="flex items-center space-x-2">
@@ -231,13 +288,13 @@ export const LocksPage: React.FC = () => {
 
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium uppercase text-slate-500">Gateway Routing</span>
+            <span className="text-xs font-medium uppercase text-slate-500">Session Scrubber</span>
             <div className="rounded-lg bg-indigo-50 p-2 text-indigo-600">
               <Activity className="h-4 w-4" />
             </div>
           </div>
-          <p className="mt-2 text-sm font-semibold text-slate-900">Transparent 421 Redir</p>
-          <p className="mt-1 text-xs text-slate-500">Reverse proxy to Raft leader</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">100ms Tick Rate</p>
+          <p className="mt-1 text-xs text-slate-500">Immediate dead-worker termination</p>
         </div>
       </div>
 
@@ -273,6 +330,7 @@ export const LocksPage: React.FC = () => {
                   const expiresDate = new Date(lock.expires_at_unix_nano / 1000000);
                   const isExpired = Date.now() > expiresDate.getTime();
                   const isBeingRenewed = renewals.some((r) => r.resource_name === lock.resource_name && r.active);
+                  const isOwner = currentOwnerID !== '' && lock.owner_id === currentOwnerID;
 
                   return (
                     <tr key={lock.resource_name} className="hover:bg-slate-50">
@@ -280,7 +338,14 @@ export const LocksPage: React.FC = () => {
                         <KeyRound className="h-3.5 w-3.5 text-blue-500" />
                         <span>{lock.resource_name}</span>
                       </td>
-                      <td className="px-6 py-3.5">{lock.owner_id}</td>
+                      <td className="px-6 py-3.5">
+                        <span className="font-mono text-slate-800">{lock.owner_id}</span>
+                        {isOwner && (
+                          <span className="ml-1.5 rounded bg-blue-50 px-1.5 py-0.5 text-[10px] font-bold text-blue-700">
+                            You
+                          </span>
+                        )}
+                      </td>
                       <td className="px-6 py-3.5 font-mono text-blue-700 font-medium">
                         #{lock.fencing_token}
                       </td>
@@ -296,7 +361,8 @@ export const LocksPage: React.FC = () => {
                         </span>
                       </td>
                       <td className="px-6 py-3.5 text-right space-x-2">
-                        {!isBeingRenewed && (
+                        {/* Auto-Renew Button */}
+                        {(isOwner || isAdmin) && !isBeingRenewed && (
                           <button
                             onClick={() => handleStartRenewal(lock)}
                             className="rounded bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-100"
@@ -304,12 +370,29 @@ export const LocksPage: React.FC = () => {
                             Auto-Renew
                           </button>
                         )}
-                        <button
-                          onClick={() => handleRelease(lock)}
-                          className="rounded bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-100"
-                        >
-                          Release
-                        </button>
+
+                        {/* Release / Emergency Unlock */}
+                        {isOwner ? (
+                          <button
+                            onClick={() => handleRelease(lock)}
+                            className="rounded bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-100"
+                          >
+                            Release
+                          </button>
+                        ) : isAdmin ? (
+                          <button
+                            onClick={() => handleRelease(lock)}
+                            className="inline-flex items-center space-x-1 rounded bg-rose-100 px-2.5 py-1 text-[11px] font-bold text-rose-700 hover:bg-rose-200"
+                            title="Admin Emergency Unlock"
+                          >
+                            <ShieldAlert className="h-3 w-3" />
+                            <span>Unlock</span>
+                          </button>
+                        ) : (
+                          <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500 font-mono">
+                            Locked
+                          </span>
+                        )}
                       </td>
                     </tr>
                   );
@@ -335,7 +418,7 @@ export const LocksPage: React.FC = () => {
           <div className="overflow-x-auto">
             {sessions.length === 0 ? (
               <div className="p-8 text-center text-xs text-slate-500">
-                No registered client sessions.
+                No registered client sessions. Click &quot;Register Session&quot; to begin sending heartbeats.
               </div>
             ) : (
               <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
@@ -369,11 +452,10 @@ export const LocksPage: React.FC = () => {
                       </td>
                       <td className="px-4 py-2.5 text-right">
                         <button
-                          disabled={!s.active}
                           onClick={() => handleHeartbeat(s)}
-                          className="rounded border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                          className="rounded bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
                         >
-                          Ping
+                          Ping Heartbeat
                         </button>
                       </td>
                     </tr>
@@ -384,20 +466,20 @@ export const LocksPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Section 3: Automatic Renewal Workers */}
+        {/* Section 3: Renewal Workers */}
         <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
           <div className="border-b border-slate-200 px-6 py-4 flex items-center justify-between">
             <div className="flex items-center space-x-2">
               <Repeat className="h-5 w-5 text-purple-600" />
               <h2 className="text-sm font-semibold text-slate-900">Automated Renewal Workers</h2>
             </div>
-            <span className="text-xs text-slate-500">T_renew Dynamic Trigger</span>
+            <span className="text-xs text-slate-500">Autonomous Lease Extensions</span>
           </div>
 
           <div className="overflow-x-auto">
             {renewals.length === 0 ? (
               <div className="p-8 text-center text-xs text-slate-500">
-                No active lease renewal workers running.
+                No active lease renewal workers running. Click &quot;Auto-Renew&quot; on a lock to start one.
               </div>
             ) : (
               <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
@@ -467,14 +549,17 @@ export const LocksPage: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-slate-700">Owner ID</label>
+                <label className="block text-xs font-medium text-slate-700">
+                  Owner ID {!isAdmin && currentOwnerID && <span className="text-slate-400 font-normal">(Bound to session)</span>}
+                </label>
                 <input
                   type="text"
                   required
+                  disabled={!isAdmin && Boolean(currentOwnerID)}
                   placeholder="e.g. worker-node-primary"
                   value={acquireForm.owner_id}
                   onChange={(e) => setAcquireForm({ ...acquireForm, owner_id: e.target.value })}
-                  className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-blue-500 focus:outline-none"
+                  className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-blue-500 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
                 />
               </div>
 
@@ -517,7 +602,7 @@ export const LocksPage: React.FC = () => {
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
             <h3 className="text-base font-semibold text-slate-900">Register Client Heartbeat Session</h3>
             <p className="mt-1 text-xs text-slate-500">
-              Tracks client liveness and cancels renewal on missed heartbeats.
+              Establishes client liveness to allow autonomous lease renewals.
             </p>
 
             <form onSubmit={handleRegisterClient} className="mt-4 space-y-4">
@@ -534,14 +619,17 @@ export const LocksPage: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-slate-700">Owner ID</label>
+                <label className="block text-xs font-medium text-slate-700">
+                  Owner ID {!isAdmin && currentOwnerID && <span className="text-slate-400 font-normal">(Bound to session)</span>}
+                </label>
                 <input
                   type="text"
                   required
+                  disabled={!isAdmin && Boolean(currentOwnerID)}
                   placeholder="e.g. worker-node-primary"
                   value={registerForm.owner_id}
                   onChange={(e) => setRegisterForm({ ...registerForm, owner_id: e.target.value })}
-                  className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-blue-500 focus:outline-none"
+                  className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-blue-500 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
                 />
               </div>
 

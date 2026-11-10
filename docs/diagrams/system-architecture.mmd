@@ -1,0 +1,72 @@
+graph TD
+    subgraph Clients["Client Layer"]
+        C1["Worker Service A"]
+        C2["Worker Service B"]
+        SPA["React Operator Dashboard"]
+    end
+
+    subgraph Edge["Edge Reverse Proxy"]
+        Nginx["Nginx Reverse Proxy (:80 / :443)"]
+    end
+
+    subgraph Gateway["API Gateway Layer (:8080)"]
+        GW["LockGuard API Gateway"]
+        AuthM["Auth & Security Middlewares"]
+        RL["Token-Bucket Rate Limiter"]
+        Rtr["Dynamic Leader Proxy Router"]
+        HBMgr["Client Heartbeat Manager"]
+        RenMgr["Automatic Lease Renewal Manager"]
+        AuditPipe["Asynchronous Audit Pipeline"]
+    end
+
+    subgraph Consensus["Consensus Cluster Layer (Raft Quorum: 2/3)"]
+        CoordA["Coordinator A (:8001 / :7000)<br/><i>Term Leader</i>"]
+        CoordB["Coordinator B (:8001 / :7000)<br/><i>Follower</i>"]
+        CoordC["Coordinator C (:8001 / :7000)<br/><i>Follower</i>"]
+        BoltA[("BoltDB Log Store A")]
+        BoltB[("BoltDB Log Store B")]
+        BoltC[("BoltDB Log Store C")]
+    end
+
+    subgraph Storage["Operational Audit Store"]
+        PG[("PostgreSQL 16 (:5432)<br/>Audit History & Events<br/><i>*Non-Authoritative*</i>")]
+    end
+
+    subgraph Resources["External Application Domain"]
+        PR["Protected Resource Service (:9000)<br/><i>Fencing Guard Enforcement</i>"]
+    end
+
+    subgraph Telemetry["Observability"]
+        Prom["Prometheus Server (:9090)"]
+    end
+
+    C1 -->|HTTP Lock Mutation| Nginx
+    C2 -->|HTTP Lock Mutation| Nginx
+    SPA -->|REST API / State Probing| Nginx
+
+    Nginx -->|/api/ Proxying| GW
+    Nginx -->|/ Static Assets| SPA
+
+    GW --- AuthM
+    AuthM --> RL
+    RL --> Rtr
+    GW --- HBMgr
+    GW --- RenMgr
+    GW --> AuditPipe
+
+    Rtr -->|TCP / TLS 1.3 Leader Request| CoordA
+    CoordA <==>|Raft Log Replication mTLS:7000| CoordB
+    CoordA <==>|Raft Log Replication mTLS:7000| CoordC
+
+    CoordA --- BoltA
+    CoordB --- BoltB
+    CoordC --- BoltC
+
+    AuditPipe -.->|Asynchronous Batched Events| PG
+    C1 -->|Mutation + Fencing Token| PR
+    C2 -->|Mutation + Fencing Token| PR
+
+    GW -.->|/metrics| Prom
+    CoordA -.->|/metrics| Prom
+    PR -.->|/metrics| Prom
+

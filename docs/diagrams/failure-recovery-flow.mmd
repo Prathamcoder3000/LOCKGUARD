@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    actor Client as Distributed Client
+    participant GW as API Gateway
+    participant L as Leader Node (Node 1)
+    participant F as Follower Node (Node 2)
+    participant FSM as Replicated FSM
+
+    Note over Client,L: Client holds active lock on "db-migration" with LeaseVersion 1
+    
+    rect rgb(240, 210, 210)
+        Note over L: Crash / Hardware Failure / Network Partition
+        L--xGW: Leader Unreachable
+        L--xF: Heartbeats cease
+    end
+
+    Note over F: Election timer fires on Follower (Node 2)
+    F->>F: Elects self as Leader with quorum from Node 3
+    Note over F: Node 2 becomes new Raft Leader
+
+    Client->>GW: POST /v1/locks/renew {resource: "db-migration", session_id, lease_version: 1}
+    GW->>L: HTTP Forward to old leader (failed connection)
+    GW->>GW: Interceptor detects leader failure / stale leader
+    GW->>F: GET /v1/cluster/status -> discovers Node 2 is leader
+    GW->>F: POST /v1/locks/renew (Retry against Node 2)
+    
+    F->>FSM: Replicate RenewCommand to Quorum
+    FSM-->>F: Command Committed (LeaseVersion 2)
+    F-->>GW: HTTP 200 OK (LeaseVersion 2, Expiry extended)
+    GW-->>Client: HTTP 200 OK (Renewed successfully)
+    
+    Note over Client,F: Seamless failover completed without lock state corruption
+

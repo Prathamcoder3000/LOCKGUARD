@@ -38,6 +38,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/locks", h.handleLocks)
 	mux.HandleFunc("/v1/locks/", h.handleGetLock)
 	mux.HandleFunc("/v1/cluster/status", h.handleClusterStatus)
+	mux.HandleFunc("/v1/cluster/stepdown", h.handleStepDown)
 	mux.HandleFunc("/health", h.handleHealth)
 	mux.HandleFunc("/ready", h.handleReady)
 }
@@ -105,8 +106,9 @@ func (h *Handler) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		ts = time.Now().UnixNano()
 	}
 
+	reqID := resolveRequestID(req.RequestID, r, "req-acq")
 	cmd := lockstate.AcquireLockCommand{
-		RequestID:         strings.TrimSpace(req.RequestID),
+		RequestID:         reqID,
 		ResourceName:      strings.TrimSpace(req.ResourceName),
 		OwnerID:           strings.TrimSpace(req.OwnerID),
 		TTLNanoseconds:    ttlNano,
@@ -150,8 +152,9 @@ func (h *Handler) handleRenew(w http.ResponseWriter, r *http.Request) {
 		ts = time.Now().UnixNano()
 	}
 
+	reqID := resolveRequestID(req.RequestID, r, "req-rnw")
 	cmd := lockstate.RenewLockCommand{
-		RequestID:         strings.TrimSpace(req.RequestID),
+		RequestID:         reqID,
 		ResourceName:      strings.TrimSpace(req.ResourceName),
 		OwnerID:           strings.TrimSpace(req.OwnerID),
 		FencingToken:      req.FencingToken,
@@ -191,8 +194,9 @@ func (h *Handler) handleRelease(w http.ResponseWriter, r *http.Request) {
 		ts = time.Now().UnixNano()
 	}
 
+	reqID := resolveRequestID(req.RequestID, r, "req-rel")
 	cmd := lockstate.ReleaseLockCommand{
-		RequestID:         strings.TrimSpace(req.RequestID),
+		RequestID:         reqID,
 		ResourceName:      strings.TrimSpace(req.ResourceName),
 		OwnerID:           strings.TrimSpace(req.OwnerID),
 		FencingToken:      req.FencingToken,
@@ -231,8 +235,9 @@ func (h *Handler) handleExpire(w http.ResponseWriter, r *http.Request) {
 		ts = time.Now().UnixNano()
 	}
 
+	reqID := resolveRequestID(req.RequestID, r, "req-exp")
 	cmd := lockstate.ExpireLockCommand{
-		RequestID:                 strings.TrimSpace(req.RequestID),
+		RequestID:                 reqID,
 		ResourceName:              strings.TrimSpace(req.ResourceName),
 		ExpectedOwnerID:           strings.TrimSpace(req.ExpectedOwnerID),
 		ExpectedFencingToken:      req.ExpectedFencingToken,
@@ -381,6 +386,26 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) handleStepDown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		api.RespondError(w, http.StatusMethodNotAllowed, api.ErrCodeMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if !h.node.IsLeader() {
+		api.RespondError(w, http.StatusConflict, api.ErrCodeNotLeader, "node is not the active Raft leader", nil)
+		return
+	}
+	err := h.node.LeadershipTransfer()
+	if err != nil {
+		api.RespondError(w, http.StatusInternalServerError, api.ErrCodeInternal, err.Error(), nil)
+		return
+	}
+	api.RespondSuccess(w, http.StatusOK, map[string]interface{}{
+		"message": "leadership transfer initiated successfully",
+		"node_id": h.nodeID,
+	})
+}
+
 func (h *Handler) handleApplyError(w http.ResponseWriter, err error) {
 	var notLeaderErr *consensus.NotLeaderError
 	if errors.As(err, &notLeaderErr) {
@@ -422,4 +447,16 @@ func mapErrorCodeToStatus(code string) int {
 	default:
 		return http.StatusInternalServerError // 500
 	}
+}
+
+func resolveRequestID(raw string, r *http.Request, prefix string) string {
+	id := strings.TrimSpace(raw)
+	if id != "" {
+		return id
+	}
+	id = strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	if id != "" {
+		return id
+	}
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }

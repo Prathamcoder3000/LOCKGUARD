@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    actor Client as Worker Client
+    participant GW as API Gateway
+    participant Leader as Raft Leader
+    participant Quorum as Raft Majority Quorum
+    participant FSM as Deterministic FSM
+
+    Client->>GW: POST /v1/locks/release {resource_name, owner_id, fencing_token: T}
+    GW->>Leader: Proxy Release Command to Raft Leader
+
+    Leader->>Quorum: Replicate ReleaseLockCommand across Cluster
+    Quorum-->>Leader: Replicated to Majority Quorum (2/3)
+
+    Leader->>FSM: Commit & Apply Release to FSM
+    Note over FSM: 1. Verify Active Lock Exists<br/>2. Match Owner ID == Active Owner<br/>3. Match Fencing Token == Active Token T<br/>4. Remove Lock Record<br/>5. Preserve Resource HighestToken = T<br/>6. Record History Entry
+
+    FSM-->>Leader: Release Success
+    Leader-->>GW: HTTP 200 OK {success: true}
+    GW-->>Client: HTTP 200 OK {released: true}
+
+    Note over FSM: Resource is now FREE.<br/>Next acquisition by ANY worker<br/>will receive FencingToken = T + 1
+

@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    actor T as Election Timer
+    participant F as Follower (Node 2)
+    participant N1 as Node 1 (Follower)
+    participant N3 as Node 3 (Follower)
+
+    Note over F: Leader heartbeat timeout expires (150-300ms)
+    T->>F: Trigger Election
+    Note over F: State -> Candidate<br/>Term: Term + 1<br/>VoteFor: Self (Node 2)
+    
+    par RequestVote RPCs
+        F->>N1: RequestVote(Term=T+1, CandidateId=Node2, LastLogIndex, LastLogTerm)
+        F->>N3: RequestVote(Term=T+1, CandidateId=Node2, LastLogIndex, LastLogTerm)
+    end
+
+    Note over N1: Validate Term >= Local Term<br/>Validate Not Voted in Term<br/>Validate Candidate Log >= Local Log
+    N1-->>F: RequestVoteResponse(VoteGranted=true, Term=T+1)
+    
+    Note over N3: Validate Log Up-to-Date
+    N3-->>F: RequestVoteResponse(VoteGranted=true, Term=T+1)
+
+    Note over F: Quorum Granted (3/3 votes >= 2)<br/>State -> Leader
+    
+    par Immediate Heartbeats (AppendEntries)
+        F->>N1: AppendEntries(Term=T+1, LeaderId=Node2, PrevLogIndex, PrevLogTerm, Entries=[], LeaderCommit)
+        F->>N3: AppendEntries(Term=T+1, LeaderId=Node2, PrevLogIndex, PrevLogTerm, Entries=[], LeaderCommit)
+    end
+
+    N1-->>F: AppendEntriesResponse(Success=true, Term=T+1)
+    N3-->>F: AppendEntriesResponse(Success=true, Term=T+1)
+    Note over F,N3: Raft Cluster Stable with Node 2 as Leader
+

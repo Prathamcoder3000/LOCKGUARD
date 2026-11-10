@@ -197,7 +197,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
 	s.mux.HandleFunc("/metrics", s.metricsReg.Handler())
 
-	// Versioned Health & Readiness routes under /api/v1/
+	// Versioned Health & Readiness routes under /v1/ and /api/v1/
+	s.mux.HandleFunc("/v1/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
+	s.mux.HandleFunc("/v1/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
+	s.mux.HandleFunc("/v1/metrics", s.metricsReg.Handler())
 	s.mux.HandleFunc("/api/v1/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
 	s.mux.HandleFunc("/api/v1/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
 	s.mux.HandleFunc("/api/v1/metrics", s.metricsReg.Handler())
@@ -244,6 +247,105 @@ func (s *Server) registerRoutes() {
 	})
 	s.mux.Handle("/v1/admin/cluster/nodes", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminNodesHandler)))
 	s.mux.Handle("/api/v1/admin/cluster/nodes", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminNodesHandler)))
+
+	// Admin Emergency Unlock: allows administrators to break any active lock
+	adminEmergencyUnlockHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
+			return
+		}
+		var req struct {
+			ResourceName string `json:"resource_name"`
+			OwnerID      string `json:"owner_id"`
+			FencingToken uint64 `json:"fencing_token"`
+		}
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			RespondError(w, http.StatusBadRequest, ErrCodeBadRequest, "failed to read body", nil)
+			return
+		}
+		if err := json.Unmarshal(bodyBytes, &req); err != nil || strings.TrimSpace(req.ResourceName) == "" {
+			RespondError(w, http.StatusBadRequest, ErrCodeBadRequest, "valid json with resource_name required", nil)
+			return
+		}
+		req.ResourceName = strings.TrimSpace(req.ResourceName)
+
+		leaderURL, err := s.discovery.GetLeader(r.Context())
+		if err != nil || leaderURL == "" {
+			RespondError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "no leader available for emergency unlock", nil)
+			return
+		}
+
+		// If OwnerID or FencingToken not provided, resolve current lock from leader
+		if req.OwnerID == "" || req.FencingToken == 0 {
+			lockURL := fmt.Sprintf("%s/v1/locks/%s", leaderURL, req.ResourceName)
+			resp, err := http.Get(lockURL)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				RespondError(w, http.StatusNotFound, ErrCodeLockNotFound, "active lock not found for resource", nil)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				return
+			}
+			var lockData struct {
+				Data struct {
+					OwnerID      string `json:"owner_id"`
+					FencingToken uint64 `json:"fencing_token"`
+				} `json:"data"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&lockData)
+			_ = resp.Body.Close()
+			if lockData.Data.OwnerID == "" {
+				RespondError(w, http.StatusNotFound, ErrCodeLockNotFound, "active lock record not held", nil)
+				return
+			}
+			req.OwnerID = lockData.Data.OwnerID
+			req.FencingToken = lockData.Data.FencingToken
+		}
+
+		releasePayload, _ := json.Marshal(map[string]interface{}{
+			"request_id":    fmt.Sprintf("admin-unlock-%d", time.Now().UnixNano()),
+			"resource_name": req.ResourceName,
+			"owner_id":      req.OwnerID,
+			"fencing_token": req.FencingToken,
+		})
+		r.Body = io.NopCloser(bytes.NewReader(releasePayload))
+		r.URL.Path = "/v1/locks/release"
+		s.handleLockOperation(w, r)
+	})
+	s.mux.Handle("/v1/admin/locks/emergency-unlock", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminEmergencyUnlockHandler)))
+	s.mux.Handle("/api/v1/admin/locks/emergency-unlock", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminEmergencyUnlockHandler)))
+
+	// Admin Stepdown: allows administrators to trigger a Raft leadership transfer
+	adminStepdownHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
+			return
+		}
+		leaderURL, err := s.discovery.GetLeader(r.Context())
+		if err != nil || leaderURL == "" {
+			RespondError(w, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "no leader available for stepdown", nil)
+			return
+		}
+		stepURL := fmt.Sprintf("%s/v1/cluster/stepdown", leaderURL)
+		reqStep, err := http.NewRequestWithContext(r.Context(), http.MethodPost, stepURL, nil)
+		if err != nil {
+			RespondError(w, http.StatusInternalServerError, ErrCodeInternal, err.Error(), nil)
+			return
+		}
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(reqStep)
+		if err != nil {
+			RespondError(w, http.StatusBadGateway, ErrCodeInternal, "failed to communicate with leader: "+err.Error(), nil)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	})
+	s.mux.Handle("/v1/admin/cluster/stepdown", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminStepdownHandler)))
+	s.mux.Handle("/api/v1/admin/cluster/stepdown", s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(adminStepdownHandler)))
 }
 
 func (s *Server) stripAPIPrefix(handler interface{}) http.HandlerFunc {
@@ -458,13 +560,22 @@ func (s *Server) recordProxyAuditEvent(r *http.Request, reqBytes []byte, statusC
 		}
 	}
 
+	clientID := reqData.ClientID
+	if clientID == "" {
+		clientID = reqData.OwnerID
+	}
+	ownerID := reqData.OwnerID
+	if ownerID == "" {
+		ownerID = clientID
+	}
+
 	ev := &audit.Event{
 		EventType:       eventType,
 		EventCategory:   audit.CategoryLockOperation,
 		RequestID:       r.Header.Get("X-Request-ID"),
 		ResourceID:      resName,
-		OwnerID:         reqData.OwnerID,
-		ClientID:        reqData.ClientID,
+		OwnerID:         ownerID,
+		ClientID:        clientID,
 		FencingToken:    fToken,
 		LeaseVersion:    lVer,
 		OperationStatus: status,
@@ -519,8 +630,10 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"snapshot_manager":   "operational_phase3",
 		"persistence_layer":  "operational_phase3",
 		"audit_pipeline":     "operational_phase3",
-		"protected_resource": "pending_phase4",
-		"benchmark_module":   "pending_phase5",
+		"protected_resource": "operational_phase4",
+		"fault_engine":       "operational_phase4",
+		"security_rbac":      "operational_phase5",
+		"benchmark_module":   "operational_phase5",
 	}
 
 	status := ClusterStatusResponse{

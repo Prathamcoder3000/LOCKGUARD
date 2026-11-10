@@ -138,4 +138,13 @@ export const clusterService = {
   async stopRenewal(resource_name: string): Promise<void> {
     await apiClient.post('/renewal/stop', { resource_name });
   },
+
+  async adminEmergencyUnlock(resource_name: string): Promise<void> {
+    await apiClient.post('/admin/locks/emergency-unlock', { resource_name });
+  },
+
+  async adminStepdown(): Promise<{ message: string; node_id?: string }> {
+    const res = await apiClient.post<{ success: boolean; data: { message: string; node_id?: string } }>('/admin/cluster/stepdown');
+    return res.data.data;
+  },
 };

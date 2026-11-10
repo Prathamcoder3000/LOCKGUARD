@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    actor Client as Client / Admin
+    participant GW as API Gateway Middleware
+    participant Auth as Auth Service
+    participant RL as Rate Limiter
+    participant Coord as Coordinator / Core FSM
+
+    Client->>GW: POST /v1/auth/login {username: "client1", password: "pwd"}
+    GW->>Auth: Authenticate(credentials)
+    Auth->>Auth: Verify PBKDF2/Argon2 password hash
+    Auth->>Auth: Generate Signed JWT (HMAC-SHA256)<br/>claims: {sub, owner_id, role, exp}
+    Auth-->>Client: HTTP 200 OK {access_token: "jwt...", expires_in: 86400}
+
+    Client->>GW: POST /v1/locks/acquire<br/>Authorization: Bearer <jwt>
+    GW->>RL: CheckRateLimit(authenticated_subject)
+    alt Rate Limit Exceeded
+        RL-->>Client: HTTP 429 Too Many Requests
+    else Within Rate Limits
+        RL-->>GW: Allow Request
+    end
+
+    GW->>Auth: ValidateToken(jwt)
+    alt Token Invalid / Expired
+        Auth-->>Client: HTTP 401 Unauthorized
+    else Valid Token
+        GW->>GW: RBAC Check (Role 'client' allowed for Acquire)
+        alt Role Denied (e.g. 'read-only' attempting mutate)
+            GW-->>Client: HTTP 403 Forbidden
+        else Role Authorized
+            GW->>Coord: Forward Authorized Request (OwnerID injected)
+            Coord-->>Client: HTTP 200 OK (Lock Granted)
+        end
+    end
+

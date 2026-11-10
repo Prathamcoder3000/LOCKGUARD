@@ -280,16 +280,21 @@ func TestRealDatabaseOutage_EndToEnd(t *testing.T) {
 	})
 
 	// Wait for pipeline batch flush to persist events to PostgreSQL
-	time.Sleep(150 * time.Millisecond)
-
-	// Query PostgreSQL via AuditRepository directly
-	persistedEvents, total, err := restoredRepo.ListEvents(context.Background(), persistence.AuditFilter{
-		ResourceID: "critical_job_db_down",
-		Limit:      10,
-	})
-	if err != nil {
-		t.Fatalf("failed to query audit events from restored postgres: %v", err)
+	var persistedEvents []*persistence.AuditEventRecord
+	var total int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var qErr error
+		persistedEvents, total, qErr = restoredRepo.ListEvents(context.Background(), persistence.AuditFilter{
+			ResourceID: "critical_job_db_down",
+			Limit:      10,
+		})
+		if qErr == nil && total >= 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+
 	if total < 3 {
 		t.Fatalf("expected at least 3 audit events persisted in PostgreSQL, got %d", total)
 	}

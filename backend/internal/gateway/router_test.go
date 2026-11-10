@@ -59,7 +59,7 @@ func TestGateway_LeaderDiscoveryAndCaching(t *testing.T) {
 	disc := NewLeaderDiscovery([]string{followerServer.URL, leaderServer.URL}, 500*time.Millisecond, leaderServer.Client(), reg)
 
 	// First discovery
-	leaderURL, err := disc.GetLeader(t.Context())
+	leaderURL, err := disc.GetLeader(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error discovering leader: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestGateway_LeaderDiscoveryAndCaching(t *testing.T) {
 
 	// Second resolution should hit cache without increasing probe count on /v1/cluster/status
 	currHits := atomic.LoadInt32(&leaderHits)
-	cachedURL, err := disc.GetLeader(t.Context())
+	cachedURL, err := disc.GetLeader(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error on cached leader: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestGateway_LeaderDiscoveryAndCaching(t *testing.T) {
 
 	// Invalidate and verify rediscovery occurs
 	disc.InvalidateLeader()
-	_, err = disc.GetLeader(t.Context())
+	_, err = disc.GetLeader(context.Background())
 	if err != nil {
 		t.Fatalf("failed rediscovery after invalidation: %v", err)
 	}

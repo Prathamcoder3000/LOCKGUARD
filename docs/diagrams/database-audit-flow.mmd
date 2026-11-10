@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant Raft as Raft Leader FSM
+    participant Hook as Audit Hook / Producer
+    participant Queue as Bounded In-Memory Queue (Buffer)
+    participant Worker as Background Batch Flusher
+    participant DB as PostgreSQL Database
+
+    Note over Raft: Command Committed to Quorum
+    Raft->>Hook: EmitAuditEvent(eventType, resource, owner, token)
+    Hook->>Queue: Non-blocking enqueue (Drop oldest or ring-buffer on overflow)
+    
+    loop Every flush_interval (e.g. 100ms) or max_batch_size (e.g. 50 events)
+        Worker->>Queue: Dequeue batch of audit events
+        alt Database Online
+            Worker->>DB: BEGIN TRANSACTION
+            Worker->>DB: INSERT INTO audit_events (batch of rows)
+            DB-->>Worker: COMMIT SUCCESS
+        else Database Degraded / Unreachable
+            Worker->>Worker: Log error, retain failed batch in bounded retry buffer
+            Worker->>Worker: Exponential backoff with jitter
+            Note over Worker: Core Raft operations continue unaffected (Best-effort audit buffering)
+        end
+    end
+

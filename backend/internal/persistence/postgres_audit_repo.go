@@ -210,15 +210,21 @@ func (r *PostgresAuditRepo) ListEvents(ctx context.Context, filter AuditFilter) 
 		args = append(args, filter.ResourceID)
 		argIdx++
 	}
-	if filter.OwnerID != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("owner_id = $%d", argIdx))
+	if filter.OwnerID != "" && filter.ClientID != "" && filter.OwnerID == filter.ClientID {
+		whereClauses = append(whereClauses, fmt.Sprintf("(owner_id = $%d OR client_id = $%d)", argIdx, argIdx))
 		args = append(args, filter.OwnerID)
 		argIdx++
-	}
-	if filter.ClientID != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("client_id = $%d", argIdx))
-		args = append(args, filter.ClientID)
-		argIdx++
+	} else {
+		if filter.OwnerID != "" {
+			whereClauses = append(whereClauses, fmt.Sprintf("owner_id = $%d", argIdx))
+			args = append(args, filter.OwnerID)
+			argIdx++
+		}
+		if filter.ClientID != "" {
+			whereClauses = append(whereClauses, fmt.Sprintf("client_id = $%d", argIdx))
+			args = append(args, filter.ClientID)
+			argIdx++
+		}
 	}
 	if filter.RequestID != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("request_id = $%d", argIdx))

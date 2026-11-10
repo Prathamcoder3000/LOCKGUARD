@@ -59,15 +59,15 @@ export const Header: React.FC<HeaderProps> = ({ onOpenSidebar }) => {
           {isOnline === true ? (
             <>
               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-              <span className="font-medium text-emerald-700">API Connected</span>
+              <span className="font-medium text-emerald-700">API Online</span>
               {health?.version && (
                 <span className="font-mono text-slate-400">v{health.version}</span>
               )}
             </>
           ) : isOnline === false ? (
             <>
-              <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
-              <span className="font-medium text-amber-700">API Offline (Phase 0)</span>
+              <AlertCircle className="h-3.5 w-3.5 text-rose-500" />
+              <span className="font-medium text-rose-700">API Offline</span>
             </>
           ) : (
             <span className="text-slate-400">Connecting...</span>

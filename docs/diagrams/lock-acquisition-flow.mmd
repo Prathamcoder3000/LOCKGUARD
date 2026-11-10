@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    actor Client as Worker Client
+    participant GW as API Gateway (:8080)
+    participant Leader as Raft Leader (Coord A :8001)
+    participant Quorum as Raft Followers (B & C)
+    participant FSM as Deterministic FSM
+    participant Audit as Audit Pipeline & PG
+
+    Client->>GW: POST /v1/locks/acquire {resource_name, owner_id, ttl_seconds}
+    Note over GW: Extract Key (JWT sub / HMAC / IP)<br/>Token-Bucket Rate Limiter Check<br/>Leader Discovery Cache Lookup
+
+    GW->>Leader: Forward Request to Discovered Leader (:8001)
+    Note over Leader: Leader Authority Verification<br/>Verify Active Term Leadership
+
+    Leader->>Quorum: AppendEntries RPC (Replicate Acquire Command)
+    Quorum-->>Leader: AppendEntries Success (Quorum Majority 2/3 Reached)
+
+    Leader->>FSM: Commit & Apply Command to FSM
+    Note over FSM: Check Idempotency<br/>Verify Resource Availability<br/>Advance Monotonic Fencing Token (T = T + 1)<br/>Set LeaseVersion = 1, Compute Expiry
+
+    FSM-->>Leader: Return State Transition Result (FencingToken, LeaseVersion)
+    Leader-->>GW: HTTP 200 OK {success: true, fencing_token: T, lease_version: 1}
+    
+    par Asynchronous Audit Ingestion
+        GW-)Audit: Queue Audit Event (Non-blocking batch flusher)
+    and Client Response Delivery
+        GW-->>Client: HTTP 200 OK {fencing_token: T, lease_version: 1, ttl: 30s}
+    end
+

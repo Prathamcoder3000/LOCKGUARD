@@ -25,11 +25,12 @@ export const LoginPage: React.FC = () => {
 
       if (res.data && res.data.data) {
         const { token, user: userBrief } = res.data.data;
-        const mappedRole = userBrief.role === 'ADMIN' ? 'admin' : userBrief.role === 'READ_ONLY' ? 'developer' : 'operator';
+        const normalizedRole = userBrief.role ? userBrief.role.toUpperCase() : 'CLIENT';
         login(token, {
           id: userBrief.id || `usr-${username}`,
           username: userBrief.username,
-          role: mappedRole,
+          role: normalizedRole,
+          owner_id: userBrief.owner_id || '',
           email: `${userBrief.username}@lockguard.internal`,
         });
         navigate('/');

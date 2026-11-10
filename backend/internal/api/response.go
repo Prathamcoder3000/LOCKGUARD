@@ -23,6 +23,8 @@ const (
 	ErrCodeMethodNotAllowed  = "ERR_METHOD_NOT_ALLOWED"
 	ErrCodeOwnerMismatch     = "ERR_OWNER_MISMATCH"
 	ErrCodeRateLimitExceeded = "ERR_RATE_LIMIT_EXCEEDED"
+	ErrCodeServiceUnavailable = "ERR_SERVICE_UNAVAILABLE"
+	ErrCodeLockNotFound      = "ERR_LOCK_NOT_FOUND"
 )
 
 // APIResponse represents the standard success JSON envelope.

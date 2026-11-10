@@ -62,8 +62,17 @@ func (m *mockAuditRepo) ListEvents(ctx context.Context, filter persistence.Audit
 		if filter.ResourceID != "" && e.ResourceID != filter.ResourceID {
 			continue
 		}
-		if filter.ClientID != "" && e.ClientID != filter.ClientID {
-			continue
+		if filter.ClientID != "" && filter.OwnerID != "" && filter.ClientID == filter.OwnerID {
+			if e.ClientID != filter.ClientID && e.OwnerID != filter.OwnerID {
+				continue
+			}
+		} else {
+			if filter.ClientID != "" && e.ClientID != filter.ClientID {
+				continue
+			}
+			if filter.OwnerID != "" && e.OwnerID != filter.OwnerID {
+				continue
+			}
 		}
 		matched = append(matched, e)
 	}

@@ -17,6 +17,7 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 # Replace default nginx config with SPA routing
 RUN echo 'server { \
     listen 80; \
+    listen [::]:80; \
     server_name localhost; \
     location / { \
         root /usr/share/nginx/html; \
@@ -32,7 +33,7 @@ RUN echo 'server { \
 EXPOSE 80
 
 HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
-  CMD wget -qO- http://localhost/health || exit 1
+  CMD wget -qO- http://127.0.0.1/health || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]
 

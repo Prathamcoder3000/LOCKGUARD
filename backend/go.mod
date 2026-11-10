@@ -1,6 +1,6 @@
 module lockguard/backend
 
-go 1.27.3
+go 1.22
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
