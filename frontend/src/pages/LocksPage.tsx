@@ -21,10 +21,12 @@ import {
   RenewalStatus,
 } from '../services/clusterService';
 import { useAuth } from '../context/AuthContext';
+import { auditService, AuditEvent } from '../services/auditService';
 
 export const LocksPage: React.FC = () => {
   const { user } = useAuth();
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = (user?.role || '').toUpperCase() === 'ADMIN';
+  const isReadOnly = (user?.role || '').toUpperCase() === 'READ_ONLY';
   const currentOwnerID = user?.owner_id || '';
 
   const [locks, setLocks] = useState<LockRecord[]>([]);
@@ -87,6 +89,49 @@ export const LocksPage: React.FC = () => {
     return () => clearInterval(timer);
   }, [fetchData]);
 
+  const [nowMs, setNowMs] = React.useState<number>(() => Date.now());
+  const [recentExpirations, setRecentExpirations] = React.useState<AuditEvent[]>([]);
+  const expiredBoundaryTriggeredRef = React.useRef<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  React.useEffect(() => {
+    let active = true;
+    auditService
+      .getEvents({ event_type: 'LOCK_EXPIRE', limit: 5 })
+      .then((res) => {
+        if (active) setRecentExpirations(res.events || []);
+      })
+      .catch(() => {
+        // Non-blocking audit strip
+      });
+    return () => {
+      active = false;
+    };
+  }, [locks]);
+
+  React.useEffect(() => {
+    const newlyExpired = locks.filter((lock) => {
+      const expiresMs = lock.expires_at_unix_nano / 1000000;
+      const key = `${lock.resource_name}:${lock.fencing_token}:${lock.expires_at_unix_nano}`;
+      return lock.status !== 'EXPIRED' && nowMs >= expiresMs && !expiredBoundaryTriggeredRef.current.has(key);
+    });
+    if (newlyExpired.length > 0) {
+      newlyExpired.forEach((lock) => {
+        expiredBoundaryTriggeredRef.current.add(
+          `${lock.resource_name}:${lock.fencing_token}:${lock.expires_at_unix_nano}`
+        );
+      });
+      const refreshTimer = setTimeout(() => {
+        fetchData();
+      }, 450);
+      return () => clearTimeout(refreshTimer);
+    }
+  }, [locks, nowMs]);
+
   const handleAcquire = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -131,6 +176,34 @@ export const LocksPage: React.FC = () => {
     }
   };
 
+  const STORE_SESSION_KEY = 'lockguard_client_sessions';
+
+  const saveClientSessionSecret = (clientId: string, sessionId?: string) => {
+    if (!clientId || !sessionId || sessionId === '[REDACTED]') return;
+    try {
+      const existing = JSON.parse(localStorage.getItem(STORE_SESSION_KEY) || '{}');
+      existing[clientId] = sessionId;
+      localStorage.setItem(STORE_SESSION_KEY, JSON.stringify(existing));
+    } catch {
+      // ignore storage quota errors
+    }
+  };
+
+  const resolveClientSessionSecret = (clientId: string, fallbackSessionId?: string): string => {
+    if (fallbackSessionId && fallbackSessionId !== '[REDACTED]') {
+      return fallbackSessionId;
+    }
+    try {
+      const existing = JSON.parse(localStorage.getItem(STORE_SESSION_KEY) || '{}');
+      if (existing[clientId] && existing[clientId] !== '[REDACTED]') {
+        return existing[clientId];
+      }
+    } catch {
+      // ignore parse errors
+    }
+    return fallbackSessionId || '';
+  };
+
   const handleRegisterClient = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -138,7 +211,8 @@ export const LocksPage: React.FC = () => {
         ...registerForm,
         owner_id: !isAdmin && currentOwnerID ? currentOwnerID : registerForm.owner_id,
       };
-      await clusterService.registerClient(payload);
+      const created = await clusterService.registerClient(payload);
+      saveClientSessionSecret(created.client_id || payload.client_id, created.session_id);
       setShowRegisterModal(false);
       setRegisterForm({
         client_id: currentOwnerID ? `client-${currentOwnerID}` : '',
@@ -153,7 +227,12 @@ export const LocksPage: React.FC = () => {
 
   const handleHeartbeat = async (s: ClientSession) => {
     try {
-      await clusterService.sendHeartbeat({ client_id: s.client_id, session_id: s.session_id });
+      const sid = resolveClientSessionSecret(s.client_id, s.session_id);
+      if (!sid || sid === '[REDACTED]') {
+        window.alert('Cannot ping heartbeat: secret session_id is only available in the browser session that registered this client. Register a new session after expiry.');
+        return;
+      }
+      await clusterService.sendHeartbeat({ client_id: s.client_id, session_id: sid });
       fetchData();
     } catch (err: any) {
       alert(`Heartbeat Failed: ${err?.response?.data?.error?.message || err.message}`);
@@ -161,8 +240,15 @@ export const LocksPage: React.FC = () => {
   };
 
   const handleStartRenewal = async (lock: LockRecord) => {
-    // Look up an active session for this lock owner
-    const matchingSession = sessions.find((s) => s.owner_id === lock.owner_id && s.active);
+    // Prefer an active session for this owner whose secret session_id is held locally
+    const matchingSession =
+      sessions.find(
+        (s) =>
+          s.owner_id === lock.owner_id &&
+          s.active &&
+          resolveClientSessionSecret(s.client_id, s.session_id) !== '[REDACTED]' &&
+          resolveClientSessionSecret(s.client_id, s.session_id) !== ''
+      ) || sessions.find((s) => s.owner_id === lock.owner_id && s.active);
 
     if (!matchingSession) {
       const registerNow = confirm(
@@ -179,12 +265,20 @@ export const LocksPage: React.FC = () => {
       return;
     }
 
+    const sid = resolveClientSessionSecret(matchingSession.client_id, matchingSession.session_id);
+    if (!sid || sid === '[REDACTED]') {
+      alert(
+        `Active session "${matchingSession.client_id}" belongs to an external client or prior browser session without its secret session_id stored locally. Register a new client session after it expires to control Auto-Renew from this browser.`
+      );
+      return;
+    }
+
     try {
       await clusterService.startRenewal({
         resource_name: lock.resource_name,
         owner_id: lock.owner_id,
         client_id: matchingSession.client_id,
-        session_id: matchingSession.session_id,
+        session_id: sid,
         fencing_token: lock.fencing_token,
         lease_version: lock.lease_version,
         expires_at_unix_nano: lock.expires_at_unix_nano,
@@ -198,7 +292,17 @@ export const LocksPage: React.FC = () => {
 
   const handleStopRenewal = async (resource_name: string) => {
     try {
-      await clusterService.stopRenewal(resource_name);
+      const worker = renewals.find((r) => r.resource_name === resource_name);
+      let sid = worker ? resolveClientSessionSecret(worker.client_id, worker.session_id) : '';
+      if (!sid || sid === '[REDACTED]') {
+        const activeSession = worker
+          ? sessions.find((s) => s.client_id === worker.client_id)
+          : sessions.find((s) => s.active);
+        if (activeSession) {
+          sid = resolveClientSessionSecret(activeSession.client_id, activeSession.session_id);
+        }
+      }
+      await clusterService.stopRenewal(resource_name, sid || undefined);
       fetchData();
     } catch (err: any) {
       alert(`Stop Renewal Failed: ${err?.response?.data?.error?.message || err.message}`);
@@ -216,20 +320,24 @@ export const LocksPage: React.FC = () => {
           </p>
         </div>
         <div className="flex items-center space-x-2">
-          <button
-            onClick={() => setShowRegisterModal(true)}
-            className="inline-flex items-center space-x-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 shadow-sm"
-          >
-            <Users className="h-4 w-4 text-slate-500" />
-            <span>Register Session</span>
-          </button>
-          <button
-            onClick={() => setShowAcquireModal(true)}
-            className="inline-flex items-center space-x-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 shadow-sm transition"
-          >
-            <Plus className="h-4 w-4" />
-            <span>Acquire Lock</span>
-          </button>
+          {!isReadOnly && (
+            <>
+              <button
+                onClick={() => setShowRegisterModal(true)}
+                className="inline-flex items-center space-x-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 shadow-sm"
+              >
+                <Users className="h-4 w-4 text-slate-500" />
+                <span>Register Session</span>
+              </button>
+              <button
+                onClick={() => setShowAcquireModal(true)}
+                className="inline-flex items-center space-x-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 shadow-sm transition"
+              >
+                <Plus className="h-4 w-4" />
+                <span>Acquire Lock</span>
+              </button>
+            </>
+          )}
           <button
             onClick={fetchData}
             title="Refresh Telemetry"
@@ -256,7 +364,9 @@ export const LocksPage: React.FC = () => {
               <Lock className="h-4 w-4" />
             </div>
           </div>
-          <p className="mt-2 text-2xl font-bold text-slate-900">{locks.length}</p>
+          <p className="mt-2 text-2xl font-bold text-slate-900">
+            {locks.filter((l) => l.status !== 'EXPIRED' && nowMs < l.expires_at_unix_nano / 1000000).length}
+          </p>
           <p className="mt-1 text-xs text-slate-500">Replicated across Raft quorum</p>
         </div>
 
@@ -321,6 +431,7 @@ export const LocksPage: React.FC = () => {
                   <th className="px-6 py-3">Current Owner</th>
                   <th className="px-6 py-3">Fencing Token</th>
                   <th className="px-6 py-3">Lease Version</th>
+                  <th className="px-6 py-3">Status</th>
                   <th className="px-6 py-3">Expires At</th>
                   <th className="px-6 py-3 text-right">Actions</th>
                 </tr>
@@ -328,7 +439,7 @@ export const LocksPage: React.FC = () => {
               <tbody className="divide-y divide-slate-200 text-slate-800">
                 {locks.map((lock) => {
                   const expiresDate = new Date(lock.expires_at_unix_nano / 1000000);
-                  const isExpired = Date.now() > expiresDate.getTime();
+                  const isExpired = lock.status === 'EXPIRED' || nowMs >= expiresDate.getTime();
                   const isBeingRenewed = renewals.some((r) => r.resource_name === lock.resource_name && r.active);
                   const isOwner = currentOwnerID !== '' && lock.owner_id === currentOwnerID;
 
@@ -355,14 +466,25 @@ export const LocksPage: React.FC = () => {
                         </span>
                       </td>
                       <td className="px-6 py-3.5">
-                        <span className={`inline-flex items-center space-x-1 ${isExpired ? 'text-rose-600' : 'text-slate-600'}`}>
+                        {isExpired ? (
+                          <span className="inline-flex items-center rounded-full bg-rose-50 px-2.5 py-0.5 text-[11px] font-semibold text-rose-700 border border-rose-200">
+                            EXPIRED
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700 border border-emerald-200">
+                            HELD
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-6 py-3.5">
+                        <span className={`inline-flex items-center space-x-1 ${isExpired ? 'text-rose-600 font-semibold' : 'text-slate-600'}`}>
                           <Timer className="h-3 w-3" />
                           <span>{expiresDate.toLocaleTimeString()}</span>
                         </span>
                       </td>
                       <td className="px-6 py-3.5 text-right space-x-2">
                         {/* Auto-Renew Button */}
-                        {(isOwner || isAdmin) && !isBeingRenewed && (
+                        {(isOwner || isAdmin) && !isBeingRenewed && !isExpired && (
                           <button
                             onClick={() => handleStartRenewal(lock)}
                             className="rounded bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-100"
@@ -451,12 +573,18 @@ export const LocksPage: React.FC = () => {
                         )}
                       </td>
                       <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={() => handleHeartbeat(s)}
-                          className="rounded bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
-                        >
-                          Ping Heartbeat
-                        </button>
+                        {!isReadOnly && (isAdmin || s.owner_id === currentOwnerID) ? (
+                          <button
+                            onClick={() => handleHeartbeat(s)}
+                            className="rounded bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
+                          >
+                            Ping Heartbeat
+                          </button>
+                        ) : (
+                          <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500 font-mono">
+                            {isReadOnly ? 'Read Only' : 'Other'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -510,12 +638,18 @@ export const LocksPage: React.FC = () => {
                         </span>
                       </td>
                       <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={() => handleStopRenewal(r.resource_name)}
-                          className="rounded border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-100"
-                        >
-                          Stop
-                        </button>
+                        {!isReadOnly && (isAdmin || r.owner_id === currentOwnerID) ? (
+                          <button
+                            onClick={() => handleStopRenewal(r.resource_name)}
+                            className="rounded border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-100"
+                          >
+                            Stop
+                          </button>
+                        ) : (
+                          <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500 font-mono">
+                            {isReadOnly ? 'Read Only' : 'Other'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -524,6 +658,43 @@ export const LocksPage: React.FC = () => {
             )}
           </div>
         </div>
+      </div>
+
+      {/* Section 4: Recent Lease Expirations (Audit) */}
+      <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+        <div className="border-b border-slate-200 px-6 py-3.5 flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <Timer className="h-4 w-4 text-amber-600" />
+            <h2 className="text-sm font-semibold text-slate-900">Recent Lease Expirations (Audit)</h2>
+          </div>
+          <span className="text-xs text-slate-500">Reaped TTL leases (LOCK_EXPIRE)</span>
+        </div>
+        {recentExpirations.length === 0 ? (
+          <div className="p-5 text-center text-xs text-slate-500">
+            No recent TTL lease expirations recorded in the audit log.
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100">
+            {recentExpirations.map((ev) => (
+              <div key={ev.event_id} className="px-6 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center space-x-3">
+                  <span className="rounded bg-amber-50 border border-amber-200 px-2 py-0.5 font-mono text-[10px] font-semibold text-amber-800">
+                    LOCK_EXPIRE
+                  </span>
+                  <span className="font-mono font-semibold text-slate-900">{ev.resource_id || '—'}</span>
+                  <span className="text-slate-500">
+                    owner <span className="font-mono text-slate-700">{ev.owner_id || '—'}</span>
+                  </span>
+                </div>
+                <div className="flex items-center space-x-4 font-mono text-[11px] text-slate-500">
+                  <span>token #{ev.fencing_token}</span>
+                  <span>v{ev.lease_version}</span>
+                  <span>{new Date(ev.event_timestamp).toLocaleTimeString()}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Acquire Modal */}

@@ -3,6 +3,7 @@ import { Server, Network, CheckCircle2, XCircle, Crown, RefreshCw, ShieldAlert, 
 import { resilienceService, ClusterRecoveryReport } from '../services/resilienceService';
 import { clusterService } from '../services/clusterService';
 import { apiClient } from '../services/api';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 interface RaftLeaderStats {
@@ -35,15 +36,24 @@ export const ClusterPage: React.FC = () => {
 
       if (recData.status === 'fulfilled') {
         setRecovery(recData.value);
+      } else {
+        setRecovery(null);
+        setLeaderStats(null);
       }
 
-      if (statusRes.status === 'fulfilled' && statusRes.value.data?.data) {
+      if (recData.status === 'fulfilled' && recData.value.quorum_available === false) {
+        setLeaderStats(null);
+      } else if (statusRes.status === 'fulfilled' && statusRes.value.data?.data) {
         const raw = statusRes.value.data.data;
         if (raw.stats) {
           setLeaderStats(raw.stats);
         } else if (raw.term || raw.commit_index) {
           setLeaderStats(raw);
+        } else {
+          setLeaderStats(null);
         }
+      } else {
+        setLeaderStats(null);
       }
 
       setLastUpdated(new Date().toLocaleTimeString());
@@ -90,9 +100,9 @@ export const ClusterPage: React.FC = () => {
       {/* Header Banner */}
       <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">Coordinator Nodes &amp; Consensus</h1>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">Coordinator Nodes</h1>
           <p className="text-sm text-slate-500">
-            3-Node HashiCorp Raft consensus topology, quorum metrics, and authoritative linearizable state
+            Per-node Raft coordinator health, transport endpoints, BoltDB storage paths, and log commit telemetry
           </p>
         </div>
         <div className="flex items-center space-x-3">
@@ -101,6 +111,13 @@ export const ClusterPage: React.FC = () => {
               Refreshed: <span className="font-mono text-slate-600">{lastUpdated}</span>
             </span>
           )}
+          <Link
+            to="/consensus"
+            className="inline-flex items-center space-x-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+          >
+            <Network className="h-3.5 w-3.5" />
+            <span>Consensus &amp; Raft</span>
+          </Link>
           {isAdmin && (
             <button
               onClick={handleStepdown}
@@ -148,7 +165,11 @@ export const ClusterPage: React.FC = () => {
           <div className="mt-2 flex items-center space-x-2">
             <Crown className="h-5 w-5 text-amber-500" />
             <p className="text-lg font-bold font-mono text-slate-900">
-              {recovery?.current_leader_id || 'Electing...'}
+              {recovery
+                ? recovery.current_leader_id || (recovery.quorum_available ? 'Electing...' : 'No Leader (Quorum Lost)')
+                : loading
+                ? 'Probing...'
+                : 'Unreachable'}
             </p>
           </div>
           <p className="mt-1 text-xs text-slate-500">Sole authoritative mutating coordinator</p>
@@ -163,11 +184,13 @@ export const ClusterPage: React.FC = () => {
               }`}
             />
             <p className="text-lg font-bold text-slate-900">
-              {recovery?.quorum_state || 'ESTABLISHED'}
+              {recovery ? recovery.quorum_state : loading ? 'PROBING...' : 'UNREACHABLE'}
             </p>
           </div>
           <p className="mt-1 text-xs text-slate-500">
-            {recovery ? `${recovery.available_nodes.length} of ${recovery.total_nodes} nodes voting` : '2 of 3 required'}
+            {recovery
+              ? `${recovery.available_nodes?.length ?? 0} of ${recovery.total_nodes} nodes voting`
+              : 'Waiting for coordinator cluster telemetry'}
           </p>
         </div>
 
@@ -191,10 +214,12 @@ export const ClusterPage: React.FC = () => {
       {/* Coordinator Nodes Grid */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         {defaultNodes.map((defNode) => {
-          const liveNode = recovery?.coordinators?.find((c) => c.node_id === defNode.id);
+          const liveNode = recovery?.coordinators?.find(
+            (c) => c.node_id === defNode.id || c.endpoint === defNode.api
+          );
           const isLeader = liveNode?.is_leader ?? false;
-          const isReachable = liveNode?.reachable ?? true;
-          const role = liveNode?.role ?? (isLeader ? 'Leader' : 'Follower');
+          const isReachable = recovery ? (liveNode?.reachable ?? false) : false;
+          const role = recovery ? (liveNode?.role || (isLeader ? 'Leader' : isReachable ? 'Follower' : 'Offline')) : 'Probing...';
 
           return (
             <div
@@ -260,16 +285,35 @@ export const ClusterPage: React.FC = () => {
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-slate-400">Raft Peer Port:</span>
-                  <span className="font-mono text-slate-800">{defNode.peer}</span>
+                  <span className="text-slate-400">Raft Peer Addr:</span>
+                  <span className="font-mono text-slate-800">
+                    {liveNode?.raft_advertise_addr || liveNode?.raft_bind_addr || defNode.peer}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Internal API:</span>
                   <span className="font-mono text-slate-800">{liveNode?.endpoint || defNode.api}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-slate-400">Persistent BoltDB:</span>
-                  <span className="font-mono text-slate-800 text-[11px] truncate max-w-[150px]">{defNode.data}</span>
+                  <span className="text-slate-400">BoltDB Data Dir:</span>
+                  <span
+                    className="font-mono text-slate-800 text-[11px] truncate max-w-[160px]"
+                    title={liveNode?.data_dir || defNode.data}
+                  >
+                    {liveNode?.data_dir || defNode.data}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Term / Commit / Applied:</span>
+                  <span className="font-mono text-slate-800">
+                    T{liveNode?.current_term ?? '—'} &middot; C#{liveNode?.commit_index ?? '—'} &middot; A#{liveNode?.applied_index ?? '—'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Last Log / Partition:</span>
+                  <span className={`font-mono ${liveNode?.partitioned ? 'text-rose-600 font-semibold' : 'text-slate-800'}`}>
+                    #{liveNode?.last_index ?? '—'} ({liveNode?.partitioned ? 'PARTITIONED' : 'CONNECTED'})
+                  </span>
                 </div>
               </div>
             </div>

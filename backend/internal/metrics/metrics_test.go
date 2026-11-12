@@ -243,3 +243,39 @@ func TestMetricsRegistry_Phase5SecurityAndPerformanceMetrics(t *testing.T) {
 	}
 }
 
+func TestMetricsRegistry_RecoveryDurationReplacesPriorActionAndClampsSubMillisecond(t *testing.T) {
+	reg := NewRegistry()
+
+	// Sub-millisecond positive duration should clamp to 1ms instead of truncating to 0ms
+	reg.SetRecoveryDuration("leader_election", 0.0002)
+	val, lbl := reg.GetLatestGauge("lockguard_recovery_duration_seconds")
+	if val != 1 || lbl != `{action="leader_election"}` {
+		t.Fatalf("expected 1ms for leader_election, got val=%d lbl=%s", val, lbl)
+	}
+
+	// Updating with a different action replaces the prior action series so UI summing doesn't accumulate stale series
+	reg.SetRecoveryDuration("node_rejoin", 1.25)
+	val, lbl = reg.GetLatestGauge("lockguard_recovery_duration_seconds")
+	if val != 1250 || lbl != `{action="node_rejoin"}` {
+		t.Fatalf("expected 1250ms for node_rejoin, got val=%d lbl=%s", val, lbl)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reg.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, `action="leader_election"`) {
+		t.Fatalf("expected previous recovery duration series to be replaced, got:\n%s", body)
+	}
+	if !strings.Contains(body, `lockguard_recovery_duration_seconds{action="node_rejoin"} 1250`) {
+		t.Fatalf("expected latest recovery duration in Prometheus output, got:\n%s", body)
+	}
+
+	reg.IncAuthzDenial("client")
+	reg.IncAuthzDenial("auditor")
+	if total := reg.GetCounterTotal("lockguard_authz_denials_total"); total != 2 {
+		t.Fatalf("expected summed counter total=2, got %d", total)
+	}
+}
+
+

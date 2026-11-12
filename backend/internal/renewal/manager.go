@@ -25,13 +25,17 @@ var (
 	ErrLeaseExpired          = errors.New("cannot start renewal: lock lease has already expired")
 )
 
+// AuditCallback notifies an external audit pipeline of renewal lifecycle events.
+type AuditCallback func(eventType, resourceName, ownerID, clientID, status, errorCode string, fencingToken, leaseVersion uint64, meta map[string]interface{})
+
 // Manager coordinates automated lease renewal workers across distributed locks.
 type Manager struct {
-	mu        sync.RWMutex
-	workers   map[string]*renewalWorker
-	client    LockClient
-	heartbeat *heartbeat.Manager
-	metrics   *metrics.Registry
+	mu            sync.RWMutex
+	workers       map[string]*renewalWorker
+	client        LockClient
+	heartbeat     *heartbeat.Manager
+	metrics       *metrics.Registry
+	auditCallback AuditCallback
 
 	safetyMargin time.Duration
 	retryInitial time.Duration
@@ -71,6 +75,22 @@ func NewManager(cfg *config.Config, client LockClient, hb *heartbeat.Manager, re
 	}
 
 	return m
+}
+
+// SetAuditCallback binds a callback that emits renewal lifecycle audit events.
+func (m *Manager) SetAuditCallback(cb AuditCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditCallback = cb
+}
+
+func (m *Manager) emitAudit(eventType, resourceName, ownerID, clientID, status, errorCode string, fencingToken, leaseVersion uint64, meta map[string]interface{}) {
+	m.mu.RLock()
+	cb := m.auditCallback
+	m.mu.RUnlock()
+	if cb != nil {
+		cb(eventType, resourceName, ownerID, clientID, status, errorCode, fencingToken, leaseVersion, meta)
+	}
 }
 
 // StartRenewal launches a single renewal worker for a leased resource.
@@ -126,7 +146,6 @@ func (m *Manager) StartRenewal(
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Generation-aware worker replacement and duplicate prevention
 	if existing, found := m.workers[res]; found {
@@ -134,13 +153,16 @@ func (m *Manager) StartRenewal(
 		if st.Active {
 			// Reject stale generations where fencing token or lease version is older
 			if fencingToken < st.FencingToken {
+				m.mu.Unlock()
 				return ErrStaleWorkerGeneration
 			}
 			if fencingToken == st.FencingToken && leaseVersion < st.LeaseVersion {
+				m.mu.Unlock()
 				return ErrStaleWorkerGeneration
 			}
 			if fencingToken == st.FencingToken && leaseVersion == st.LeaseVersion && st.OwnerID == owner {
 				// Exact duplicate worker already actively managing this generation
+				m.mu.Unlock()
 				return nil
 			}
 		}
@@ -162,11 +184,22 @@ func (m *Manager) StartRenewal(
 	}
 
 	onTerminated := func(resource string, w *renewalWorker) {
+		var stopped bool
 		m.mu.Lock()
-		defer m.mu.Unlock()
 		if current, ok := m.workers[resource]; ok && current == w {
 			delete(m.workers, resource)
 			m.metrics.DecGauge("lockguard_renewals_active", nil)
+			stopped = true
+		}
+		m.mu.Unlock()
+		if stopped {
+			st := w.Status()
+			m.emitAudit("RENEWAL_STOPPED", st.ResourceName, st.OwnerID, st.ClientID, "COMMITTED", "", st.FencingToken, st.LeaseVersion, map[string]interface{}{
+				"reason":              "worker_terminated",
+				"last_error":          st.LastError,
+				"attempt_count":       st.AttemptCount,
+				"last_attempt_status": st.LastAttemptStatus,
+			})
 		}
 	}
 
@@ -186,6 +219,11 @@ func (m *Manager) StartRenewal(
 	m.workers[res] = worker
 	m.metrics.IncGauge("lockguard_renewals_active", nil)
 	worker.Start()
+	m.mu.Unlock()
+
+	m.emitAudit("RENEWAL_STARTED", res, owner, client, "COMMITTED", "", fencingToken, leaseVersion, map[string]interface{}{
+		"ttl_seconds": ttl.Seconds(),
+	})
 
 	return nil
 }
@@ -213,6 +251,12 @@ func (m *Manager) StopRenewal(resourceName, sessionID string) error {
 	m.mu.Unlock()
 
 	worker.Stop()
+	st := worker.Status()
+	m.emitAudit("RENEWAL_STOPPED", st.ResourceName, st.OwnerID, st.ClientID, "COMMITTED", "", st.FencingToken, st.LeaseVersion, map[string]interface{}{
+		"reason":              "explicit_stop",
+		"attempt_count":       st.AttemptCount,
+		"last_attempt_status": st.LastAttemptStatus,
+	})
 	return nil
 }
 
@@ -236,6 +280,12 @@ func (m *Manager) StopAllForSession(sessionID string) {
 
 	for _, w := range toStop {
 		w.Stop()
+		st := w.Status()
+		m.emitAudit("RENEWAL_STOPPED", st.ResourceName, st.OwnerID, st.ClientID, "COMMITTED", "", st.FencingToken, st.LeaseVersion, map[string]interface{}{
+			"reason":              "session_expired",
+			"attempt_count":       st.AttemptCount,
+			"last_attempt_status": st.LastAttemptStatus,
+		})
 	}
 }
 

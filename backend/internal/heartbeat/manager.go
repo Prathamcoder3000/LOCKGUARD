@@ -25,6 +25,9 @@ var (
 // SessionExpiredCallback is invoked when a session expires or is closed.
 type SessionExpiredCallback func(s *ClientSession)
 
+// AuditCallback notifies an external audit pipeline of session lifecycle transitions.
+type AuditCallback func(eventType, clientID, ownerID, sessionID, status, errorCode string, meta map[string]interface{})
+
 // Manager manages client registrations, heartbeat pings, and session lifecycle.
 type Manager struct {
 	mu             sync.RWMutex
@@ -33,6 +36,7 @@ type Manager struct {
 	defaultTTL     time.Duration
 	metrics        *metrics.Registry
 	onExpiredHooks []SessionExpiredCallback
+	auditCallback  AuditCallback
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
@@ -68,6 +72,22 @@ func (m *Manager) OnSessionExpired(hook SessionExpiredCallback) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onExpiredHooks = append(m.onExpiredHooks, hook)
+}
+
+// SetAuditCallback binds a callback that emits session lifecycle audit events.
+func (m *Manager) SetAuditCallback(cb AuditCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditCallback = cb
+}
+
+func (m *Manager) emitAudit(eventType, clientID, ownerID, sessionID, status, errorCode string, meta map[string]interface{}) {
+	m.mu.RLock()
+	cb := m.auditCallback
+	m.mu.RUnlock()
+	if cb != nil {
+		cb(eventType, clientID, ownerID, sessionID, status, errorCode, meta)
+	}
 }
 
 // Start launches the background expiration scrubber.
@@ -117,6 +137,9 @@ func (m *Manager) scrubExpiredSessions() {
 	m.mu.Unlock()
 
 	for _, s := range expired {
+		m.emitAudit("SESSION_EXPIRED", s.ClientID(), s.OwnerID(), s.SessionID(), "COMMITTED", "", map[string]interface{}{
+			"reason": "heartbeat_timeout",
+		})
 		for _, hook := range hooks {
 			hook(s)
 		}
@@ -136,15 +159,17 @@ func (m *Manager) Register(clientID, ownerID string, ttl time.Duration) (*Client
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	existing, found := m.sessions[cid]
 	if found {
 		if existing.OwnerID() != oid {
+			m.mu.Unlock()
+			m.emitAudit("CLIENT_REGISTER", cid, oid, "", "REJECTED", "ERR_OWNER_MISMATCH", nil)
 			return nil, ErrOwnerMismatch
 		}
 		// If existing session is still active, reject duplicate registration to prevent token harvesting
 		if existing.IsActive() {
+			m.mu.Unlock()
+			m.emitAudit("CLIENT_REGISTER", cid, oid, "", "REJECTED", "ERR_SESSION_ALREADY_ACTIVE", nil)
 			return nil, ErrSessionAlreadyActive
 		}
 		// If existing was expired/deactivated, recreate new session with fresh token
@@ -152,6 +177,10 @@ func (m *Manager) Register(clientID, ownerID string, ttl time.Duration) (*Client
 		token := generateSessionToken()
 		s := NewClientSession(cid, oid, token, ttl)
 		m.sessions[cid] = s
+		m.mu.Unlock()
+		m.emitAudit("CLIENT_REGISTER", cid, oid, token, "COMMITTED", "", map[string]interface{}{
+			"ttl_seconds": ttl.Seconds(),
+		})
 		return s, nil
 	}
 
@@ -159,7 +188,11 @@ func (m *Manager) Register(clientID, ownerID string, ttl time.Duration) (*Client
 	s := NewClientSession(cid, oid, token, ttl)
 	m.sessions[cid] = s
 	m.metrics.IncGauge("lockguard_active_client_sessions", nil)
+	m.mu.Unlock()
 
+	m.emitAudit("CLIENT_REGISTER", cid, oid, token, "COMMITTED", "", map[string]interface{}{
+		"ttl_seconds": ttl.Seconds(),
+	})
 	return s, nil
 }
 
@@ -174,21 +207,25 @@ func (m *Manager) Heartbeat(clientID, sessionID string) (*ClientSession, error) 
 
 	if !found {
 		m.metrics.IncCounter("lockguard_heartbeat_received_total", map[string]string{"status": "not_found"})
+		m.emitAudit("CLIENT_HEARTBEAT", cid, "", sid, "FAILED", "ERR_SESSION_NOT_FOUND", nil)
 		return nil, ErrSessionNotFound
 	}
 
 	if s.SessionID() != sid {
 		m.metrics.IncCounter("lockguard_heartbeat_received_total", map[string]string{"status": "mismatch"})
+		m.emitAudit("CLIENT_HEARTBEAT", cid, s.OwnerID(), sid, "REJECTED", "ERR_SESSION_MISMATCH", nil)
 		return nil, ErrSessionMismatch
 	}
 
 	if !s.IsActive() {
 		m.metrics.IncCounter("lockguard_heartbeat_received_total", map[string]string{"status": "expired"})
+		m.emitAudit("CLIENT_HEARTBEAT", cid, s.OwnerID(), sid, "FAILED", "ERR_SESSION_EXPIRED", nil)
 		return nil, ErrSessionExpired
 	}
 
 	s.Refresh()
 	m.metrics.IncCounter("lockguard_heartbeat_received_total", map[string]string{"status": "ok"})
+	m.emitAudit("CLIENT_HEARTBEAT", cid, s.OwnerID(), sid, "COMMITTED", "", nil)
 	return s, nil
 }
 
@@ -248,6 +285,9 @@ func (m *Manager) CloseSession(clientID, sessionID string) error {
 	for _, hook := range hooks {
 		hook(s)
 	}
+	m.emitAudit("SESSION_EXPIRED", s.ClientID(), s.OwnerID(), s.SessionID(), "COMMITTED", "", map[string]interface{}{
+		"reason": "explicit_close",
+	})
 
 	return nil
 }

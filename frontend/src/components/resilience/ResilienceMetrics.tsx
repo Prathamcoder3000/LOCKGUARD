@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { BarChart3 } from 'lucide-react';
+import { apiClient } from '../../services/api';
 
 interface MetricItem {
   name: string;
@@ -11,29 +12,94 @@ interface MetricItem {
   status: 'good' | 'neutral' | 'warn';
 }
 
-export const ResilienceMetrics: React.FC = () => {
+function parsePrometheusMetrics(text: string): Record<string, number> {
+  const sums: Record<string, number> = {};
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+]?\d+(?:\.\d+)?)$/);
+    if (!match) continue;
+    const name = match[1];
+    const val = Number(match[2]);
+    if (!Number.isNaN(val)) {
+      sums[name] = (sums[name] ?? 0) + val;
+    }
+  }
+  return sums;
+}
+
+interface ResilienceMetricsProps {
+  refreshKey?: number;
+}
+
+export const ResilienceMetrics: React.FC<ResilienceMetricsProps> = ({ refreshKey = 0 }) => {
+  const [parsed, setParsed] = useState<Record<string, number>>({});
+  const [nodesOnline, setNodesOnline] = useState<number | null>(null);
+  const [totalNodes, setTotalNodes] = useState<number>(3);
+  const [quorumAvail, setQuorumAvail] = useState<number | null>(null);
+  const [fetchError, setFetchError] = useState<boolean>(false);
+
+  const loadMetrics = useCallback(async () => {
+    try {
+      const [metricsRes, clusterRes] = await Promise.allSettled([
+        apiClient.get('/metrics', { responseType: 'text', transformResponse: [(data) => data] }),
+        apiClient.get('/recovery/cluster'),
+      ]);
+
+      let nextParsed: Record<string, number> = {};
+      let ok = false;
+
+      if (metricsRes.status === 'fulfilled' && typeof metricsRes.value.data === 'string') {
+        nextParsed = parsePrometheusMetrics(metricsRes.value.data);
+        setParsed(nextParsed);
+        ok = true;
+      }
+
+      if (clusterRes.status === 'fulfilled' && clusterRes.value.data?.data) {
+        const cl = clusterRes.value.data.data;
+        setNodesOnline(Array.isArray(cl.available_nodes) ? cl.available_nodes.length : 0);
+        setTotalNodes(typeof cl.total_nodes === 'number' && cl.total_nodes > 0 ? cl.total_nodes : 3);
+        setQuorumAvail(cl.quorum_available ? 1 : 0);
+        ok = true;
+      }
+
+      setFetchError(!ok);
+    } catch {
+      setFetchError(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMetrics();
+    const id = setInterval(loadMetrics, 10000);
+    return () => clearInterval(id);
+  }, [loadMetrics, refreshKey]);
+
+  const quorumVal = quorumAvail ?? parsed['lockguard_quorum_available'] ?? 0;
+  const nodesVal = nodesOnline ?? parsed['lockguard_cluster_nodes_available'] ?? 0;
+
   const metrics: MetricItem[] = [
     {
       name: 'Raft Quorum Available',
       key: 'lockguard_quorum_available',
-      value: 1,
+      value: fetchError && quorumAvail === null ? '—' : quorumVal,
       type: 'gauge',
       description: '1 if majority quorum is currently formed, 0 if lost',
-      status: 'good',
+      status: quorumVal === 1 ? 'good' : 'warn',
     },
     {
       name: 'Cluster Nodes Online',
       key: 'lockguard_cluster_nodes_available',
-      value: 3,
-      unit: '/ 3',
+      value: fetchError && nodesOnline === null ? '—' : nodesVal,
+      unit: `/ ${totalNodes}`,
       type: 'gauge',
       description: 'Active coordinator nodes participating in consensus',
-      status: 'good',
+      status: nodesVal >= Math.floor(totalNodes / 2) + 1 ? 'good' : 'warn',
     },
     {
       name: 'Leader Changes Total',
       key: 'lockguard_leader_changes_total',
-      value: 2,
+      value: parsed['lockguard_leader_changes_total'] ?? 0,
       type: 'counter',
       description: 'Total leader elections and transitions observed',
       status: 'neutral',
@@ -41,16 +107,16 @@ export const ResilienceMetrics: React.FC = () => {
     {
       name: 'Recovery Duration',
       key: 'lockguard_recovery_duration_seconds',
-      value: '103',
+      value: parsed['lockguard_recovery_duration_seconds'] ?? 0,
       unit: 'ms',
       type: 'gauge',
-      description: 'Leader failover detection and election duration',
+      description: 'Latest recorded subsystem recovery duration',
       status: 'good',
     },
     {
       name: 'Chaos Tests Total',
       key: 'lockguard_chaos_tests_total',
-      value: 3,
+      value: parsed['lockguard_chaos_tests_total'] ?? 0,
       type: 'counter',
       description: 'Executed chaos engineering injection experiments',
       status: 'neutral',
@@ -58,7 +124,7 @@ export const ResilienceMetrics: React.FC = () => {
     {
       name: 'Partitions Injected',
       key: 'lockguard_network_partitions_total',
-      value: 1,
+      value: parsed['lockguard_network_partitions_total'] ?? 0,
       type: 'counter',
       description: 'Network split scenarios tested with fail-closed safety',
       status: 'neutral',
@@ -66,18 +132,26 @@ export const ResilienceMetrics: React.FC = () => {
     {
       name: 'Snapshot Restores',
       key: 'lockguard_snapshot_restore_total',
-      value: 1,
+      value: parsed['lockguard_snapshot_restore_total'] ?? 0,
       type: 'counter',
       description: 'State machine restores from compacted snapshot',
       status: 'good',
     },
     {
-      name: 'Stale Token Blocks',
-      key: 'lockguard_protected_resource_errors_total',
-      value: 1,
+      name: 'Authz Denials Total',
+      key: 'lockguard_authz_denials_total',
+      value: parsed['lockguard_authz_denials_total'] ?? 0,
       type: 'counter',
-      description: 'Protected resource 409 fencing token rejections',
-      status: 'good',
+      description: 'RBAC & cross-owner authorization rejections (HTTP 403)',
+      status: (parsed['lockguard_authz_denials_total'] ?? 0) > 0 ? 'warn' : 'good',
+    },
+    {
+      name: 'Auth Failures Total',
+      key: 'lockguard_auth_failures_total',
+      value: parsed['lockguard_auth_failures_total'] ?? 0,
+      type: 'counter',
+      description: 'Unauthenticated, expired, or invalid JWT rejections (HTTP 401)',
+      status: (parsed['lockguard_auth_failures_total'] ?? 0) > 0 ? 'warn' : 'good',
     },
   ];
 
@@ -100,7 +174,7 @@ export const ResilienceMetrics: React.FC = () => {
         </span>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
         {metrics.map((m) => (
           <div
             key={m.key}

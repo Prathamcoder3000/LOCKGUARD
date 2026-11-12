@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -278,9 +279,56 @@ func (r *Registry) IncProtectedResourceErrors(errType string) {
 	r.IncCounter("lockguard_protected_resource_errors_total", map[string]string{"error_type": errType})
 }
 
-// SetRecoveryDuration records the duration in milliseconds of a recovery operation.
+// SetRecoveryDuration records the duration in milliseconds of the most recent recovery operation.
+// Clearing prior action series ensures dashboards summing this gauge always reflect the latest recovery duration.
 func (r *Registry) SetRecoveryDuration(action string, durationSeconds float64) {
-	r.SetGauge("lockguard_recovery_duration_seconds", map[string]string{"action": action}, int64(durationSeconds*1000))
+	ms := int64(math.Round(durationSeconds * 1000))
+	if durationSeconds > 0 && ms < 1 {
+		ms = 1
+	}
+	if ms < 0 {
+		ms = 0
+	}
+
+	lblStr := formatLabels(map[string]string{"action": action})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	series := make(map[string]*int64, 1)
+	v := ms
+	series[lblStr] = &v
+	r.gauges["lockguard_recovery_duration_seconds"] = series
+}
+
+// GetCounterTotal returns the summed counter value across all label series for a metric.
+func (r *Registry) GetCounterTotal(name string) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	series, ok := r.counters[name]
+	if !ok {
+		return 0
+	}
+	var total uint64
+	for _, ptr := range series {
+		total += atomic.LoadUint64(ptr)
+	}
+	return total
+}
+
+// GetLatestGauge returns the current gauge value and its label key (deterministic across sorted keys).
+func (r *Registry) GetLatestGauge(name string) (int64, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	series, ok := r.gauges[name]
+	if !ok || len(series) == 0 {
+		return 0, ""
+	}
+	lbls := make([]string, 0, len(series))
+	for l := range series {
+		lbls = append(lbls, l)
+	}
+	sort.Strings(lbls)
+	last := lbls[len(lbls)-1]
+	return atomic.LoadInt64(series[last]), last
 }
 
 // IncAuthSuccess records a successful authentication.

@@ -7,52 +7,7 @@ interface FailureHistoryProps {
 }
 
 export const FailureHistory: React.FC<FailureHistoryProps> = ({ events }) => {
-  // If no failure events in audit yet, display sample verified scenarios from Phase 4 tests
-  const displayEvents: FailureEvent[] =
-    events && events.length > 0
-      ? events
-      : [
-          {
-            event_id: 'evt-rec-001',
-            event_type: 'LEADER_FAILOVER_COMPLETED',
-            event_category: 'CONSENSUS_RECOVERY',
-            resource_id: 'cluster-wide',
-            owner_id: 'coordinator-b',
-            operation_status: 'SUCCESS',
-            recorded_at: new Date(Date.now() - 360000).toISOString(),
-            error_code: 'NONE',
-          },
-          {
-            event_id: 'evt-rec-002',
-            event_type: 'STALE_FENCING_TOKEN_BLOCKED',
-            event_category: 'PROTECTED_RESOURCE_GUARD',
-            resource_id: 'bank-account-4491',
-            owner_id: 'worker-stale-01',
-            operation_status: 'REJECTED_409',
-            recorded_at: new Date(Date.now() - 720000).toISOString(),
-            error_code: 'ERR_FENCING_TOKEN_STALE',
-          },
-          {
-            event_id: 'evt-rec-003',
-            event_type: 'NETWORK_PARTITION_HEALED',
-            event_category: 'CHAOS_ORCHESTRATION',
-            resource_id: 'isolated-node-c',
-            owner_id: 'chaos-engine',
-            operation_status: 'RECONCILED',
-            recorded_at: new Date(Date.now() - 1440000).toISOString(),
-            error_code: 'NONE',
-          },
-          {
-            event_id: 'evt-rec-004',
-            event_type: 'DB_OUTAGE_BACKLOG_DRAINED',
-            event_category: 'PERSISTENCE_RECOVERY',
-            resource_id: 'audit-buffer',
-            owner_id: 'drain-worker',
-            operation_status: 'FLUSH_SUCCESS',
-            recorded_at: new Date(Date.now() - 2880000).toISOString(),
-            error_code: 'NONE',
-          },
-        ];
+  const displayEvents: FailureEvent[] = Array.isArray(events) ? events : [];
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -74,6 +29,15 @@ export const FailureHistory: React.FC<FailureHistoryProps> = ({ events }) => {
       </div>
 
       <div className="mt-4 overflow-x-auto">
+        {displayEvents.length === 0 ? (
+          <div className="rounded-lg border border-slate-100 bg-slate-50/70 p-8 text-center">
+            <CheckCircle className="mx-auto h-7 w-7 text-emerald-500 mb-2" />
+            <p className="text-xs font-semibold text-slate-800">No Failure or Rejection Events Recorded</p>
+            <p className="text-[11px] text-slate-500 mt-1">
+              Live rejected or failure events persisted in PostgreSQL audit_events will appear here automatically.
+            </p>
+          </div>
+        ) : (
         <table className="w-full text-left text-xs">
           <thead className="bg-slate-50 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
             <tr>
@@ -133,6 +97,7 @@ export const FailureHistory: React.FC<FailureHistoryProps> = ({ events }) => {
             })}
           </tbody>
         </table>
+        )}
       </div>
     </div>
   );

@@ -24,10 +24,14 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 	return claims, ok && claims != nil
 }
 
+// SecurityAuditCallback notifies an external audit pipeline of authentication failures and authorization denials.
+type SecurityAuditCallback func(eventType, actorID, role, endpoint, reason string)
+
 // Middleware provides HTTP authentication and RBAC authorization filters.
 type Middleware struct {
-	authService *Service
-	metrics     *metrics.Registry
+	authService   *Service
+	metrics       *metrics.Registry
+	auditCallback SecurityAuditCallback
 }
 
 // NewMiddleware creates an authentication and authorization middleware wrapper.
@@ -38,19 +42,24 @@ func NewMiddleware(service *Service, reg *metrics.Registry) *Middleware {
 	}
 }
 
+// SetAuditCallback binds a security audit event callback for 401/403 rejections.
+func (m *Middleware) SetAuditCallback(cb SecurityAuditCallback) {
+	m.auditCallback = cb
+}
+
 // Authenticate verifies the Bearer JWT or static token on incoming requests.
 func (m *Middleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			m.recordAuthFailure("missing_header")
+			m.recordAuthFailure(r.URL.Path, "missing_header")
 			respondAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "missing authorization header")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			m.recordAuthFailure("invalid_format")
+			m.recordAuthFailure(r.URL.Path, "invalid_format")
 			respondAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "invalid authorization header format (expected 'Bearer <token>')")
 			return
 		}
@@ -62,7 +71,7 @@ func (m *Middleware) Authenticate(next http.Handler) http.Handler {
 			if err == ErrExpiredToken {
 				reason = "expired_token"
 			}
-			m.recordAuthFailure(reason)
+			m.recordAuthFailure(r.URL.Path, reason)
 			respondAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", err.Error())
 			return
 		}
@@ -81,7 +90,7 @@ func (m *Middleware) RequireRole(roles ...string) func(http.Handler) http.Handle
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims, ok := ClaimsFromContext(r.Context())
 			if !ok {
-				m.recordAuthFailure("no_claims_in_context")
+				m.recordAuthFailure(r.URL.Path, "no_claims_in_context")
 				respondAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "authentication required")
 				return
 			}
@@ -95,7 +104,7 @@ func (m *Middleware) RequireRole(roles ...string) func(http.Handler) http.Handle
 			}
 
 			if !hasRole {
-				m.recordAuthzDenial(r.URL.Path, claims.Role)
+				m.recordAuthzDenial(r.URL.Path, claims.Subject, claims.Role, "insufficient_role")
 				respondAuthError(w, http.StatusForbidden, "ERR_FORBIDDEN", "insufficient role permissions for this endpoint")
 				return
 			}
@@ -123,7 +132,7 @@ func (m *Middleware) EnforceOwnerIsolation(next http.Handler) http.Handler {
 
 		// Read-Only role cannot mutate locks
 		if claims.Role == RoleReadOnly && (r.Method == http.MethodPost || r.Method == http.MethodDelete || r.Method == http.MethodPut) {
-			m.recordAuthzDenial(r.URL.Path, claims.Role)
+			m.recordAuthzDenial(r.URL.Path, claims.Subject, claims.Role, "read_only_mutation_denied")
 			respondAuthError(w, http.StatusForbidden, "ERR_FORBIDDEN", "read-only role cannot execute mutating operations")
 			return
 		}
@@ -150,7 +159,7 @@ func (m *Middleware) EnforceOwnerIsolation(next http.Handler) http.Handler {
 					}
 
 					if targetOwner != "" && !strings.EqualFold(targetOwner, claims.Subject) {
-						m.recordAuthzDenial(r.URL.Path, claims.Role)
+						m.recordAuthzDenial(r.URL.Path, claims.Subject, claims.Role, "cross_owner_isolation")
 						respondAuthError(w, http.StatusForbidden, "ERR_OWNER_MISMATCH", "authenticated client identity mismatch with requested owner ID")
 						return
 					}
@@ -170,19 +179,25 @@ func (m *Middleware) recordAuthSuccess(role string) {
 	}
 }
 
-func (m *Middleware) recordAuthFailure(reason string) {
+func (m *Middleware) recordAuthFailure(endpoint, reason string) {
 	if m.metrics != nil {
 		m.metrics.IncCounter("lockguard_auth_failures_total", map[string]string{
 			"reason": reason,
 		})
 	}
+	if m.auditCallback != nil {
+		m.auditCallback("AUTHENTICATION_FAILURE", "", "", endpoint, reason)
+	}
 }
 
-func (m *Middleware) recordAuthzDenial(endpoint, role string) {
+func (m *Middleware) recordAuthzDenial(endpoint, subject, role, reason string) {
 	if m.metrics != nil {
 		m.metrics.IncCounter("lockguard_authz_denials_total", map[string]string{
 			"role": strings.ToLower(role),
 		})
+	}
+	if m.auditCallback != nil {
+		m.auditCallback("AUTHORIZATION_DENIAL", subject, role, endpoint, reason)
 	}
 }
 

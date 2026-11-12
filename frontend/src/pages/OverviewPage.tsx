@@ -11,11 +11,13 @@ import {
   FileCheck
 } from 'lucide-react';
 import { clusterService, HealthStatus, ReadinessStatus, ClusterStatus } from '../services/clusterService';
+import { resilienceService, ClusterRecoveryReport } from '../services/resilienceService';
 
 export const OverviewPage: React.FC = () => {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [readiness, setReadiness] = useState<ReadinessStatus | null>(null);
   const [clusterInfo, setClusterInfo] = useState<ClusterStatus | null>(null);
+  const [clusterRecovery, setClusterRecovery] = useState<ClusterRecoveryReport | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string>('');
@@ -24,15 +26,17 @@ export const OverviewPage: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const [h, r, c] = await Promise.allSettled([
+      const [h, r, c, rec] = await Promise.allSettled([
         clusterService.getHealth(),
         clusterService.getReadiness(),
         clusterService.getClusterStatus(),
+        resilienceService.getClusterRecovery(),
       ]);
 
       if (h.status === 'fulfilled') setHealth(h.value);
       if (r.status === 'fulfilled') setReadiness(r.value);
       if (c.status === 'fulfilled') setClusterInfo(c.value);
+      if (rec.status === 'fulfilled') setClusterRecovery(rec.value);
 
       if (h.status === 'rejected' && r.status === 'rejected') {
         setError('Backend API is currently unreachable. Check container health or network configuration.');
@@ -47,6 +51,8 @@ export const OverviewPage: React.FC = () => {
 
   useEffect(() => {
     fetchStatus();
+    const timer = setInterval(fetchStatus, 10000);
+    return () => clearInterval(timer);
   }, []);
 
   return (
@@ -104,9 +110,19 @@ export const OverviewPage: React.FC = () => {
               <Server className="h-4 w-4" />
             </div>
           </div>
-          <p className="mt-2 text-2xl font-bold text-slate-900">2 of 3</p>
+          <p className="mt-2 text-2xl font-bold text-slate-900">
+            {clusterRecovery
+              ? `${clusterRecovery.available_nodes?.length ?? 0} of ${clusterRecovery.total_nodes || 3}`
+              : '2 of 3'}
+          </p>
           <div className="mt-1 flex items-center text-xs font-medium text-slate-500">
-            <span>Majority required to commit</span>
+            <span>
+              {clusterRecovery?.current_leader_id
+                ? `Active Leader: ${clusterRecovery.current_leader_id}`
+                : clusterRecovery && !clusterRecovery.quorum_available
+                ? 'Quorum Lost (Fail-Closed)'
+                : 'Majority required to commit'}
+            </span>
           </div>
         </div>
 
@@ -163,31 +179,98 @@ export const OverviewPage: React.FC = () => {
           <div className="flex items-center justify-between border-b border-slate-100 pb-4">
             <div>
               <h2 className="text-base font-semibold text-slate-900">Coordinator Cluster Topology</h2>
-              <p className="text-xs text-slate-500">Specification Architecture • View Cluster tab for live dynamic telemetry</p>
+              <p className="text-xs text-slate-500">
+                Live Dynamic Raft Leadership &bull;{' '}
+                {clusterRecovery?.current_leader_id
+                  ? `Authoritative Leader: ${clusterRecovery.current_leader_id}`
+                  : 'Probing active cluster leader...'}
+              </p>
             </div>
-            <span className="inline-flex items-center rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-medium text-blue-700">
-              Raft v1.7 Specification
+            <span
+              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                clusterRecovery?.quorum_available
+                  ? 'bg-emerald-50 text-emerald-700'
+                  : 'bg-amber-50 text-amber-700'
+              }`}
+            >
+              {clusterRecovery?.quorum_available
+                ? `Quorum Active (${clusterRecovery.available_nodes?.length ?? 0}/${clusterRecovery.total_nodes || 3})`
+                : clusterRecovery
+                ? 'Quorum Degraded'
+                : 'Raft v1.7 Consensus'}
             </span>
           </div>
 
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-            {[
-              { id: 'coordinator-a', port: 7000, apiPort: 8001, role: 'Initial Bootstrap Leader', status: 'Configured' },
-              { id: 'coordinator-b', port: 7001, apiPort: 8002, role: 'Consensus Peer', status: 'Configured' },
-              { id: 'coordinator-c', port: 7002, apiPort: 8003, role: 'Consensus Peer', status: 'Configured' },
-            ].map((node) => (
-              <div key={node.id} className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-xs font-bold text-slate-800">{node.id}</span>
-                  <span className="inline-flex h-2 w-2 rounded-full bg-blue-500" />
+            {(clusterRecovery?.coordinators && clusterRecovery.coordinators.length > 0
+              ? clusterRecovery.coordinators
+              : [
+                  { node_id: 'coordinator-a', endpoint: 'http://coordinator-a:8001', reachable: false, is_leader: false, role: 'Probing...' },
+                  { node_id: 'coordinator-b', endpoint: 'http://coordinator-b:8001', reachable: false, is_leader: false, role: 'Probing...' },
+                  { node_id: 'coordinator-c', endpoint: 'http://coordinator-c:8001', reachable: false, is_leader: false, role: 'Probing...' },
+                ]
+            ).map((node) => {
+              const roleLabel = node.partitioned
+                ? 'Partitioned (Isolated)'
+                : node.is_leader
+                ? 'Leader (Authoritative)'
+                : node.reachable
+                ? node.role || 'Follower'
+                : 'Unreachable';
+              return (
+                <div
+                  key={node.node_id}
+                  className={`rounded-lg border p-4 transition-colors ${
+                    node.is_leader && !node.partitioned
+                      ? 'border-blue-300 bg-blue-50/40'
+                      : node.partitioned
+                      ? 'border-amber-300 bg-amber-50/40'
+                      : 'border-slate-200 bg-slate-50/70'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-xs font-bold text-slate-800">{node.node_id}</span>
+                    <span
+                      className={`inline-flex h-2 w-2 rounded-full ${
+                        node.partitioned
+                          ? 'bg-amber-500'
+                          : node.is_leader
+                          ? 'bg-blue-600'
+                          : node.reachable
+                          ? 'bg-emerald-500'
+                          : 'bg-rose-500'
+                      }`}
+                    />
+                  </div>
+                  <div className="mt-2 space-y-1 text-xs text-slate-600">
+                    <div>
+                      Raft Port: <span className="font-mono text-slate-900">{node.raft_bind_addr || ':7000'}</span>
+                    </div>
+                    <div>
+                      API Endpoint: <span className="font-mono text-slate-900 truncate block">{node.endpoint}</span>
+                    </div>
+                    <div className="pt-1 flex items-center justify-between text-[11px]">
+                      <span
+                        className={`font-semibold ${
+                          node.is_leader && !node.partitioned
+                            ? 'text-blue-700'
+                            : node.partitioned
+                            ? 'text-amber-700'
+                            : node.reachable
+                            ? 'text-emerald-700'
+                            : 'text-rose-600'
+                        }`}
+                      >
+                        {roleLabel}
+                      </span>
+                      {typeof node.applied_index === 'number' && node.reachable && (
+                        <span className="font-mono text-slate-500">idx #{node.applied_index}</span>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <div className="mt-2 space-y-1 text-xs text-slate-600">
-                  <div>Raft Port: <span className="font-mono text-slate-900">{node.port}</span></div>
-                  <div>API Port: <span className="font-mono text-slate-900">{node.apiPort}</span></div>
-                  <div className="pt-1 text-[11px] text-slate-500">{node.role}</div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {/* Architectural Invariants Table */}

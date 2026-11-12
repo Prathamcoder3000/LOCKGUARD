@@ -14,6 +14,11 @@ type LeaderChecker interface {
 	GetLeader(ctx context.Context) (string, error)
 }
 
+// DatabaseChecker defines an interface to verify PostgreSQL connectivity.
+type DatabaseChecker interface {
+	Ping(ctx context.Context) error
+}
+
 // HealthResponse represents liveness status.
 type HealthResponse struct {
 	Status    string `json:"status"`
@@ -53,6 +58,11 @@ func HealthHandler(serviceName, version, nodeID string) http.HandlerFunc {
 
 // ReadinessHandler checks subsystem readiness (storage accessibility, configuration validity, coordinator leader reachability).
 func ReadinessHandler(cfg *config.Config, serviceName, nodeID string, checkers ...LeaderChecker) http.HandlerFunc {
+	return ReadinessHandlerWithDB(cfg, serviceName, nodeID, nil, checkers...)
+}
+
+// ReadinessHandlerWithDB checks subsystem readiness including active PostgreSQL connectivity.
+func ReadinessHandlerWithDB(cfg *config.Config, serviceName, nodeID string, db DatabaseChecker, checkers ...LeaderChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
@@ -91,7 +101,19 @@ func ReadinessHandler(cfg *config.Config, serviceName, nodeID string, checkers .
 		}
 
 		// Database readiness state
-		components["database"] = "standby_phase0"
+		if db != nil {
+			pingCtx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+			err := db.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				components["database"] = "unavailable: " + err.Error()
+				allReady = false
+			} else {
+				components["database"] = "ready"
+			}
+		} else {
+			components["database"] = "not_configured"
+		}
 
 		// Check Coordinator Raft Leader Reachability if checker provided
 		if len(checkers) > 0 && checkers[0] != nil {

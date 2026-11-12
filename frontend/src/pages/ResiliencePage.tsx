@@ -1,10 +1,12 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Activity } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 import {
   resilienceService,
   SystemHealthReport,
   ClusterRecoveryReport,
   SnapshotDiagnosticsReport,
+  ChaosStatusReport,
   FailureEvent,
 } from '../services/resilienceService';
 import { ClusterHealth } from '../components/resilience/ClusterHealth';
@@ -13,30 +15,39 @@ import { SnapshotStatus } from '../components/resilience/SnapshotStatus';
 import { RecoveryTimeline } from '../components/resilience/RecoveryTimeline';
 import { FailureHistory } from '../components/resilience/FailureHistory';
 import { ResilienceMetrics } from '../components/resilience/ResilienceMetrics';
+import { ChaosPartitionPanel } from '../components/resilience/ChaosPartitionPanel';
 
 export const ResiliencePage: React.FC = () => {
+  const { user } = useAuth();
+  const isAdmin = (user?.role || '').toUpperCase() === 'ADMIN';
+
   const [health, setHealth] = useState<SystemHealthReport | null>(null);
   const [cluster, setCluster] = useState<ClusterRecoveryReport | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotDiagnosticsReport | null>(null);
+  const [chaosStatus, setChaosStatus] = useState<ChaosStatusReport | null>(null);
   const [events, setEvents] = useState<FailureEvent[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
+  const [metricsRefreshKey, setMetricsRefreshKey] = useState<number>(0);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const [healthData, clusterData, snapshotData, eventData] = await Promise.allSettled([
+      const [healthData, clusterData, snapshotData, chaosData, eventData] = await Promise.allSettled([
         resilienceService.getDiagnostics(),
         resilienceService.getClusterRecovery(),
         resilienceService.getSnapshots(),
+        resilienceService.getChaosStatus(),
         resilienceService.getFailureHistory(),
       ]);
 
-      if (healthData.status === 'fulfilled') setHealth(healthData.value);
-      if (clusterData.status === 'fulfilled') setCluster(clusterData.value);
-      if (snapshotData.status === 'fulfilled') setSnapshots(snapshotData.value);
+      setHealth(healthData.status === 'fulfilled' ? healthData.value : null);
+      setCluster(clusterData.status === 'fulfilled' ? clusterData.value : null);
+      setSnapshots(snapshotData.status === 'fulfilled' ? snapshotData.value : null);
+      setChaosStatus(chaosData.status === 'fulfilled' ? chaosData.value : null);
       if (eventData.status === 'fulfilled') setEvents(eventData.value);
 
+      setMetricsRefreshKey((k) => k + 1);
       setLastUpdated(new Date());
     } finally {
       setLoading(false);
@@ -86,13 +97,25 @@ export const ResiliencePage: React.FC = () => {
       <NodeStatus coordinators={cluster?.coordinators || []} />
 
       {/* Prometheus Resilience Gauges */}
-      <ResilienceMetrics />
+      <ResilienceMetrics refreshKey={metricsRefreshKey} />
+
+      {/* Controlled Chaos Engineering & Network Partition Injection */}
+      <ChaosPartitionPanel
+        cluster={cluster}
+        chaosStatus={chaosStatus}
+        isAdmin={isAdmin}
+        onActionCompleted={fetchData}
+      />
 
       {/* Failover Lifecycle Flowchart / Steps */}
       <RecoveryTimeline />
 
       {/* Raft Snapshot & Compaction Status */}
-      <SnapshotStatus snapshot={snapshots} />
+      <SnapshotStatus
+        snapshot={snapshots}
+        isAdmin={isAdmin}
+        onActionCompleted={fetchData}
+      />
 
       {/* Historical Audit of Failures & Chaos Tests */}
       <FailureHistory events={events} />

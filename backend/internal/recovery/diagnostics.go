@@ -4,11 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"lockguard/backend/internal/audit"
+	"lockguard/backend/internal/chaos"
+	"lockguard/backend/internal/consensus"
 	"lockguard/backend/internal/gateway"
+	"lockguard/backend/internal/metrics"
 	"lockguard/backend/internal/persistence"
 )
 
@@ -47,10 +54,15 @@ type SystemHealthReport struct {
 type DiagnosticsService struct {
 	nodeID      string
 	serviceName string
+	environment string
 	discovery   *gateway.LeaderDiscovery
 	db          *persistence.Database
 	migrator    *persistence.Migrator
 	pipeline    *audit.Pipeline
+	metricsReg  *metrics.Registry
+	chaosCtrl   *chaos.Controller
+	tracker     *RecoveryTracker
+	mu          sync.RWMutex
 }
 
 // NewDiagnosticsService constructs a new DiagnosticsService.
@@ -61,20 +73,97 @@ func NewDiagnosticsService(
 	migrator *persistence.Migrator,
 	pipeline *audit.Pipeline,
 ) *DiagnosticsService {
-	return &DiagnosticsService{
+	d := &DiagnosticsService{
 		nodeID:      nodeID,
 		serviceName: serviceName,
+		environment: "development",
 		discovery:   discovery,
 		db:          db,
 		migrator:    migrator,
 		pipeline:    pipeline,
+		metricsReg:  metrics.DefaultRegistry,
 	}
+	d.tracker = newRecoveryTracker(d)
+	d.initChaosController()
+	return d
 }
 
 // SetDatabase updates the database and migrator handles for diagnostics inspection.
 func (d *DiagnosticsService) SetDatabase(db *persistence.Database, migrator *persistence.Migrator) {
+	d.mu.Lock()
 	d.db = db
 	d.migrator = migrator
+	d.mu.Unlock()
+}
+
+// SetMetricsRegistry binds the authoritative Prometheus registry used by recovery tracking and chaos tests.
+func (d *DiagnosticsService) SetMetricsRegistry(reg *metrics.Registry) {
+	if reg == nil {
+		return
+	}
+	d.mu.Lock()
+	d.metricsReg = reg
+	d.initChaosControllerLocked()
+	d.mu.Unlock()
+}
+
+// SetEnvironment configures deployment environment ("development", "staging", "production").
+// Non-production environments permit controlled, admin-confirmed resilience drills.
+func (d *DiagnosticsService) SetEnvironment(env string) {
+	d.mu.Lock()
+	if strings.TrimSpace(env) != "" {
+		d.environment = strings.TrimSpace(env)
+	}
+	d.initChaosControllerLocked()
+	d.mu.Unlock()
+}
+
+func (d *DiagnosticsService) initChaosController() {
+	d.mu.Lock()
+	d.initChaosControllerLocked()
+	d.mu.Unlock()
+}
+
+func (d *DiagnosticsService) initChaosControllerLocked() {
+	isProd := strings.EqualFold(d.environment, "production") || strings.EqualFold(d.environment, "prod")
+	ctrl := chaos.NewController(chaos.Config{
+		Enabled:     !isProd,
+		Environment: d.environment,
+		Logger:      slog.Default(),
+		Metrics:     d.regLocked(),
+	})
+	d.chaosCtrl = ctrl
+}
+
+func (d *DiagnosticsService) regLocked() *metrics.Registry {
+	if d.metricsReg != nil {
+		return d.metricsReg
+	}
+	return metrics.DefaultRegistry
+}
+
+func (d *DiagnosticsService) reg() *metrics.Registry {
+	d.mu.RLock()
+	r := d.metricsReg
+	d.mu.RUnlock()
+	if r != nil {
+		return r
+	}
+	return metrics.DefaultRegistry
+}
+
+func (d *DiagnosticsService) getChaosController() *chaos.Controller {
+	d.mu.RLock()
+	ctrl := d.chaosCtrl
+	d.mu.RUnlock()
+	return ctrl
+}
+
+// StartMonitor starts background polling to detect Raft leader changes and node outage/recovery durations.
+func (d *DiagnosticsService) StartMonitor(ctx context.Context, interval time.Duration) {
+	if d.tracker != nil {
+		d.tracker.Start(ctx, interval)
+	}
 }
 
 // CollectReport performs context-bounded health checks across all subsystems and derives the overall system status.
@@ -233,11 +322,19 @@ func (d *DiagnosticsService) CollectReport(ctx context.Context) SystemHealthRepo
 
 // CoordinatorNodeStatus captures health and role for an individual coordinator node.
 type CoordinatorNodeStatus struct {
-	NodeID    string `json:"node_id"`
-	Endpoint  string `json:"endpoint"`
-	Reachable bool   `json:"reachable"`
-	IsLeader  bool   `json:"is_leader"`
-	Role      string `json:"role"`
+	NodeID            string `json:"node_id"`
+	Endpoint          string `json:"endpoint"`
+	Reachable         bool   `json:"reachable"`
+	IsLeader          bool   `json:"is_leader"`
+	Partitioned       bool   `json:"partitioned"`
+	AppliedIndex      uint64 `json:"applied_index,omitempty"`
+	CommitIndex       uint64 `json:"commit_index,omitempty"`
+	LastIndex         uint64 `json:"last_index,omitempty"`
+	CurrentTerm       uint64 `json:"current_term,omitempty"`
+	RaftBindAddr      string `json:"raft_bind_addr,omitempty"`
+	RaftAdvertiseAddr string `json:"raft_advertise_addr,omitempty"`
+	DataDir           string `json:"data_dir,omitempty"`
+	Role              string `json:"role"`
 }
 
 // ClusterRecoveryReport provides topology and quorum status for recovery diagnostics.
@@ -254,14 +351,16 @@ type ClusterRecoveryReport struct {
 
 // SnapshotDiagnosticsReport reports the state of Raft log compaction and snapshot persistence.
 type SnapshotDiagnosticsReport struct {
-	NodeID              string    `json:"node_id"`
-	SnapshotAvailable   bool      `json:"snapshot_available"`
-	LastSnapshotIndex   uint64    `json:"last_snapshot_index"`
-	LastSnapshotTerm    uint64    `json:"last_snapshot_term"`
-	SnapshotThreshold   uint64    `json:"snapshot_threshold"`
-	SnapshotInterval    string    `json:"snapshot_interval"`
-	SafeSnapshotStorage bool      `json:"safe_snapshot_storage"`
-	GeneratedAt         time.Time `json:"generated_at"`
+	NodeID              string                   `json:"node_id"`
+	LeaderID            string                   `json:"leader_id,omitempty"`
+	SnapshotAvailable   bool                     `json:"snapshot_available"`
+	LastSnapshotIndex   uint64                   `json:"last_snapshot_index"`
+	LastSnapshotTerm    uint64                   `json:"last_snapshot_term"`
+	SnapshotThreshold   uint64                   `json:"snapshot_threshold"`
+	SnapshotInterval    string                   `json:"snapshot_interval"`
+	SafeSnapshotStorage bool                     `json:"safe_snapshot_storage"`
+	Snapshots           []consensus.SnapshotInfo `json:"snapshots"`
+	GeneratedAt         time.Time                `json:"generated_at"`
 }
 
 // CollectClusterReport queries coordinator endpoints and derives active quorum and topology state.
@@ -279,54 +378,111 @@ func (d *DiagnosticsService) CollectClusterReport(ctx context.Context) ClusterRe
 	endpoints := d.discovery.Endpoints()
 	report.TotalNodes = len(endpoints)
 
-	var available []string
-	var coordStatuses []CoordinatorNodeStatus
+	available := make([]string, 0, len(endpoints))
+	coordStatuses := make([]CoordinatorNodeStatus, len(endpoints))
 	var currentLeaderID string
 	var currentLeaderURL string
 
-	leaderURL, err := d.discovery.GetLeader(ctx)
-	if err == nil && leaderURL != "" {
-		currentLeaderURL = leaderURL
-	}
+	probeTimeout := 800 * time.Millisecond
+	client := &http.Client{Timeout: probeTimeout}
 
-	client := &http.Client{Timeout: 1 * time.Second}
+	var wg sync.WaitGroup
+	for i, ep := range endpoints {
+		wg.Add(1)
+		go func(idx int, endpoint string) {
+			defer wg.Done()
 
-	for _, ep := range endpoints {
-		status := CoordinatorNodeStatus{
-			Endpoint: ep,
-			Role:     "Unknown",
-		}
+			initialNodeID := nodeIDFromEndpoint(endpoint)
+			if d.tracker != nil {
+				initialNodeID = d.tracker.ResolveNodeID(endpoint)
+			}
+			status := CoordinatorNodeStatus{
+				NodeID:   initialNodeID,
+				Endpoint: endpoint,
+				Role:     "Unknown",
+			}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep+"/v1/cluster/status", nil)
-		if err == nil {
-			resp, err := client.Do(req)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				var result struct {
-					Success bool `json:"success"`
-					Data    struct {
-						NodeID   string `json:"node_id"`
-						State    string `json:"state"`
-						IsLeader bool   `json:"is_leader"`
-						LeaderID string `json:"leader_id"`
-					} `json:"data"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&result) == nil && result.Success {
-					status.Reachable = true
-					status.NodeID = result.Data.NodeID
-					status.IsLeader = result.Data.IsLeader
-					status.Role = result.Data.State
-					available = append(available, status.NodeID)
-					if status.IsLeader {
-						currentLeaderID = status.NodeID
-						currentLeaderURL = ep
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+
+			req, reqErr := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/v1/cluster/status", nil)
+			if reqErr == nil {
+				resp, doErr := client.Do(req)
+				if doErr == nil {
+					if resp.StatusCode == http.StatusOK {
+						var result struct {
+							Success bool `json:"success"`
+							Data    struct {
+								NodeID            string `json:"node_id"`
+								State             string `json:"state"`
+								IsLeader          bool   `json:"is_leader"`
+								LeaderID          string `json:"leader_id"`
+								Partitioned       bool   `json:"partitioned"`
+								AppliedIndex      uint64 `json:"applied_index"`
+								CommitIndex       uint64 `json:"commit_index"`
+								LastIndex         uint64 `json:"last_index"`
+								CurrentTerm       uint64 `json:"current_term"`
+								RaftBindAddr      string `json:"raft_bind_addr"`
+								RaftAdvertiseAddr string `json:"raft_advertise_addr"`
+								DataDir           string `json:"data_dir"`
+							} `json:"data"`
+						}
+						if json.NewDecoder(resp.Body).Decode(&result) == nil && result.Success {
+							status.Reachable = true
+							if result.Data.NodeID != "" {
+								status.NodeID = result.Data.NodeID
+								if d.tracker != nil {
+									d.tracker.RememberEndpointNodeID(endpoint, result.Data.NodeID)
+								}
+							}
+							status.Partitioned = result.Data.Partitioned
+							status.AppliedIndex = result.Data.AppliedIndex
+							status.CommitIndex = result.Data.CommitIndex
+							status.LastIndex = result.Data.LastIndex
+							status.CurrentTerm = result.Data.CurrentTerm
+							status.RaftBindAddr = result.Data.RaftBindAddr
+							status.RaftAdvertiseAddr = result.Data.RaftAdvertiseAddr
+							status.DataDir = result.Data.DataDir
+							if status.Partitioned {
+								status.IsLeader = false
+								status.Role = "Partitioned"
+							} else {
+								status.IsLeader = result.Data.IsLeader
+								status.Role = result.Data.State
+							}
+						}
 					}
+					_ = resp.Body.Close()
 				}
-				_ = resp.Body.Close()
-			} else if resp != nil {
-				_ = resp.Body.Close()
+			}
+
+			coordStatuses[idx] = status
+		}(i, ep)
+	}
+	wg.Wait()
+
+	for _, st := range coordStatuses {
+		if st.Reachable && !st.Partitioned {
+			available = append(available, st.NodeID)
+			if st.IsLeader {
+				currentLeaderID = st.NodeID
+				currentLeaderURL = st.Endpoint
 			}
 		}
-		coordStatuses = append(coordStatuses, status)
+	}
+
+	// Majority quorum rule for N nodes: threshold = floor(N/2) + 1
+	majorityThreshold := (report.TotalNodes / 2) + 1
+	if len(available) >= majorityThreshold && currentLeaderURL == "" && d.discovery != nil {
+		if leaderURL, err := d.discovery.GetLeader(ctx); err == nil && leaderURL != "" {
+			currentLeaderURL = leaderURL
+			for _, st := range coordStatuses {
+				if st.Endpoint == leaderURL && st.Reachable && !st.Partitioned {
+					currentLeaderID = st.NodeID
+					break
+				}
+			}
+		}
 	}
 
 	report.AvailableNodes = available
@@ -334,17 +490,36 @@ func (d *DiagnosticsService) CollectClusterReport(ctx context.Context) ClusterRe
 	report.CurrentLeaderID = currentLeaderID
 	report.CurrentLeaderURL = currentLeaderURL
 
-	// Majority quorum rule for N nodes: threshold = floor(N/2) + 1
-	majorityThreshold := (report.TotalNodes / 2) + 1
 	if len(available) >= majorityThreshold && currentLeaderURL != "" {
 		report.QuorumAvailable = true
 		report.QuorumState = "ESTABLISHED"
+	} else {
+		// Fail closed: do not present an active authoritative leader when quorum is lost
+		report.QuorumAvailable = false
+		report.QuorumState = "QUORUM_LOST"
+		report.CurrentLeaderID = ""
+		report.CurrentLeaderURL = ""
+	}
+
+	reg := d.reg()
+	reg.SetQuorumAvailable(report.QuorumAvailable)
+	reg.SetClusterNodesAvailable(len(available))
+	if d.tracker != nil {
+		d.tracker.ObserveClusterReport(report)
 	}
 
 	return report
 }
 
-// CollectSnapshotReport inspects snapshot metadata from the authoritative cluster leader.
+func nodeIDFromEndpoint(endpoint string) string {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return endpoint
+}
+
+// CollectSnapshotReport inspects snapshot metadata and restorable snapshots from the authoritative cluster leader.
 func (d *DiagnosticsService) CollectSnapshotReport(ctx context.Context) SnapshotDiagnosticsReport {
 	now := time.Now().UTC()
 	report := SnapshotDiagnosticsReport{
@@ -352,6 +527,7 @@ func (d *DiagnosticsService) CollectSnapshotReport(ctx context.Context) Snapshot
 		SnapshotThreshold:   8192,
 		SnapshotInterval:    "120s",
 		SafeSnapshotStorage: true,
+		Snapshots:           []consensus.SnapshotInfo{},
 		GeneratedAt:         now,
 	}
 
@@ -382,14 +558,14 @@ func (d *DiagnosticsService) CollectSnapshotReport(ctx context.Context) Snapshot
 	var result struct {
 		Success bool `json:"success"`
 		Data    struct {
-			NodeID        string            `json:"node_id"`
-			AppliedIndex  uint64            `json:"applied_index"`
-			Stats         map[string]string `json:"stats"`
+			NodeID       string            `json:"node_id"`
+			AppliedIndex uint64            `json:"applied_index"`
+			Stats        map[string]string `json:"stats"`
 		} `json:"data"`
 	}
 
 	if json.NewDecoder(resp.Body).Decode(&result) == nil && result.Success {
-		report.SnapshotAvailable = true
+		report.LeaderID = result.Data.NodeID
 		if snapIdxStr, ok := result.Data.Stats["last_snapshot_index"]; ok {
 			var snapIdx uint64
 			_, _ = fmt.Sscanf(snapIdxStr, "%d", &snapIdx)
@@ -400,8 +576,56 @@ func (d *DiagnosticsService) CollectSnapshotReport(ctx context.Context) Snapshot
 			_, _ = fmt.Sscanf(snapTermStr, "%d", &snapTerm)
 			report.LastSnapshotTerm = snapTerm
 		}
+		report.SnapshotAvailable = report.LastSnapshotIndex > 0
+	}
+
+	// Collect restorable snapshot entries from the leader (and peer fallback if leader has none yet).
+	snaps := d.fetchNodeSnapshots(ctx, client, leaderURL)
+	if len(snaps) == 0 {
+		for _, ep := range d.discovery.Endpoints() {
+			if ep == leaderURL {
+				continue
+			}
+			if peerSnaps := d.fetchNodeSnapshots(ctx, client, ep); len(peerSnaps) > 0 {
+				snaps = peerSnaps
+				break
+			}
+		}
+	}
+	if len(snaps) > 0 {
+		report.Snapshots = snaps
+		report.SnapshotAvailable = true
+		if report.LastSnapshotIndex == 0 {
+			report.LastSnapshotIndex = snaps[0].Index
+			report.LastSnapshotTerm = snaps[0].Term
+		}
 	}
 
 	return report
+}
+
+func (d *DiagnosticsService) fetchNodeSnapshots(ctx context.Context, client *http.Client, endpoint string) []consensus.SnapshotInfo {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/v1/cluster/snapshots", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var payload struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Snapshots []consensus.SnapshotInfo `json:"snapshots"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&payload) != nil || !payload.Success {
+		return nil
+	}
+	return payload.Data.Snapshots
 }
 

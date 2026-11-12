@@ -1,5 +1,5 @@
 import React from 'react';
-import { Server, Crown, CheckCircle2, XCircle } from 'lucide-react';
+import { Server, Crown, CheckCircle2, XCircle, WifiOff } from 'lucide-react';
 import { CoordinatorNodeStatus } from '../../services/resilienceService';
 
 interface NodeStatusProps {
@@ -47,9 +47,11 @@ export const NodeStatus: React.FC<NodeStatusProps> = ({ coordinators }) => {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {displayNodes.map((node) => (
           <div
-            key={node.node_id}
+            key={node.node_id || node.endpoint}
             className={`rounded-xl border bg-white p-5 shadow-sm transition-all ${
-              node.is_leader
+              node.partitioned
+                ? 'border-amber-300 ring-2 ring-amber-100'
+                : node.is_leader
                 ? 'border-blue-300 ring-2 ring-blue-100'
                 : 'border-slate-200 hover:border-slate-300'
             }`}
@@ -58,7 +60,9 @@ export const NodeStatus: React.FC<NodeStatusProps> = ({ coordinators }) => {
               <div className="flex items-center space-x-2.5">
                 <div
                   className={`rounded-lg p-2 ${
-                    node.is_leader
+                    node.partitioned
+                      ? 'bg-amber-100 text-amber-700'
+                      : node.is_leader
                       ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/20'
                       : 'bg-slate-100 text-slate-600'
                   }`}
@@ -66,16 +70,23 @@ export const NodeStatus: React.FC<NodeStatusProps> = ({ coordinators }) => {
                   <Server className="h-4 w-4" />
                 </div>
                 <div>
-                  <h4 className="font-mono text-sm font-bold text-slate-900">{node.node_id}</h4>
+                  <h4 className="font-mono text-sm font-bold text-slate-900">{node.node_id || node.endpoint}</h4>
                   <span className="text-[11px] text-slate-500 font-mono">{node.endpoint}</span>
                 </div>
               </div>
 
-              {node.is_leader && (
-                <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">
-                  <Crown className="mr-1 h-3 w-3 text-amber-500" />
-                  Leader
+              {node.partitioned ? (
+                <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700">
+                  <WifiOff className="mr-1 h-3 w-3 text-amber-600" />
+                  Partitioned
                 </span>
+              ) : (
+                node.is_leader && (
+                  <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">
+                    <Crown className="mr-1 h-3 w-3 text-amber-500" />
+                    Leader
+                  </span>
+                )
               )}
             </div>
 
@@ -88,10 +99,19 @@ export const NodeStatus: React.FC<NodeStatusProps> = ({ coordinators }) => {
                 <span className="text-slate-500">Connectivity:</span>
                 <span
                   className={`inline-flex items-center font-medium ${
-                    node.reachable ? 'text-emerald-600' : 'text-rose-600'
+                    node.partitioned
+                      ? 'text-amber-600'
+                      : node.reachable
+                      ? 'text-emerald-600'
+                      : 'text-rose-600'
                   }`}
                 >
-                  {node.reachable ? (
+                  {node.partitioned ? (
+                    <>
+                      <WifiOff className="h-3.5 w-3.5 mr-1" />
+                      Raft Isolated
+                    </>
+                  ) : node.reachable ? (
                     <>
                       <CheckCircle2 className="h-3.5 w-3.5 mr-1" />
                       Reachable

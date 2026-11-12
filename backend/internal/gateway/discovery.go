@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lockguard/backend/internal/metrics"
@@ -135,43 +136,81 @@ func (d *LeaderDiscovery) Discover(ctx context.Context) (string, error) {
 		return d.cachedLeader, nil
 	}
 
+	probeTimeout := 1000 * time.Millisecond
+	if d.httpClient != nil && d.httpClient.Timeout > 0 && d.httpClient.Timeout < probeTimeout {
+		probeTimeout = d.httpClient.Timeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	type probeOutcome struct {
+		ep       string
+		ok       bool
+		isLeader bool
+		nodeID   string
+		leaderID string
+		leadAddr string
+	}
+
+	outcomes := make([]probeOutcome, len(d.endpoints))
+	var leaderSignaled atomic.Bool
+	var wg sync.WaitGroup
+
+	for i, ep := range d.endpoints {
+		wg.Add(1)
+		go func(idx int, endpoint string) {
+			defer wg.Done()
+			out := probeOutcome{ep: endpoint}
+			statusURL := endpoint + "/v1/cluster/status"
+			req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, statusURL, nil)
+			if err != nil {
+				outcomes[idx] = out
+				return
+			}
+			resp, err := d.httpClient.Do(req)
+			if err != nil {
+				outcomes[idx] = out
+				return
+			}
+			var env clusterStatusEnvelope
+			decErr := json.NewDecoder(resp.Body).Decode(&env)
+			_ = resp.Body.Close()
+
+			out.ok = true
+			if decErr == nil && env.Success {
+				out.nodeID = env.Data.NodeID
+				out.isLeader = env.Data.IsLeader
+				out.leaderID = env.Data.LeaderID
+				out.leadAddr = env.Data.LeaderAddress
+				if env.Data.IsLeader && leaderSignaled.CompareAndSwap(false, true) {
+					// Cancel remaining slow/unreachable probes as soon as a direct leader responds
+					cancel()
+				}
+			}
+			outcomes[idx] = out
+		}(i, ep)
+	}
+	wg.Wait()
+
 	var foundLeaderURL string
 	var reportedLeaderID string
 	var reportedLeaderAddr string
 	probeSuccessCount := 0
 
-	for _, ep := range d.endpoints {
-		statusURL := ep + "/v1/cluster/status"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
-		if err != nil {
-			continue
-		}
-
-		resp, err := d.httpClient.Do(req)
-		if err != nil {
+	for _, out := range outcomes {
+		if !out.ok {
 			continue
 		}
 		probeSuccessCount++
-
-		var env clusterStatusEnvelope
-		err = json.NewDecoder(resp.Body).Decode(&env)
-		resp.Body.Close()
-
-		if err == nil && env.Success {
-			nodeID := env.Data.NodeID
-			if nodeID != "" {
-				d.nodeToEndpoint[nodeID] = ep
-			}
-
-			if env.Data.IsLeader {
-				foundLeaderURL = ep
-				break
-			}
-
-			if env.Data.LeaderID != "" {
-				reportedLeaderID = env.Data.LeaderID
-				reportedLeaderAddr = env.Data.LeaderAddress
-			}
+		if out.nodeID != "" {
+			d.nodeToEndpoint[out.nodeID] = out.ep
+		}
+		if out.isLeader && foundLeaderURL == "" {
+			foundLeaderURL = out.ep
+		}
+		if out.leaderID != "" && reportedLeaderID == "" {
+			reportedLeaderID = out.leaderID
+			reportedLeaderAddr = out.leadAddr
 		}
 	}
 

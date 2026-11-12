@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
 
 	"lockguard/backend/internal/audit"
 	"lockguard/backend/internal/auth"
+	"lockguard/backend/internal/benchmark"
 	"lockguard/backend/internal/config"
 	"lockguard/backend/internal/gateway"
 	"lockguard/backend/internal/heartbeat"
@@ -41,15 +43,18 @@ type Server struct {
 	metricsReg    *metrics.Registry
 	db            *persistence.Database
 	migrator      *persistence.Migrator
-	auditRepo     persistence.AuditRepository
-	auditPipeline *audit.Pipeline
-	auditHandler  *audit.Handler
-	diagnostics   *recovery.DiagnosticsService
+	auditRepo       persistence.AuditRepository
+	auditPipeline   *audit.Pipeline
+	auditHandler    *audit.Handler
+	benchmarkRepo   persistence.BenchmarkRepository
+	benchmarkRunner *benchmark.Runner
+	diagnostics     *recovery.DiagnosticsService
 
 	authService    *auth.Service
 	authMiddleware *auth.Middleware
 	rateLimiter    *middleware.RateLimiter
 	loginLimiter   *middleware.RateLimiter
+	monitorCancel  context.CancelFunc
 }
 
 // ClusterStatusResponse outlines cluster topology and quorum expectations.
@@ -91,12 +96,14 @@ func NewServer(cfg *config.Config, logger *slog.Logger, serviceName, version str
 	var db *persistence.Database
 	var migrator *persistence.Migrator
 	var auditRepo persistence.AuditRepository
+	var benchmarkRepo persistence.BenchmarkRepository
 	pCfg, err := persistence.LoadConfigFromEnv()
 	if err == nil {
 		if openedDB, err := persistence.Open(pCfg); err == nil {
 			db = openedDB
 			migrator = persistence.NewMigrator(db)
 			auditRepo = persistence.NewPostgresAuditRepo(db)
+			benchmarkRepo = persistence.NewPostgresBenchmarkRepo(db)
 
 			// Execute non-blocking migration check in background
 			go func() {
@@ -119,7 +126,11 @@ func NewServer(cfg *config.Config, logger *slog.Logger, serviceName, version str
 
 	auditPipe := audit.NewPipeline(auditRepo, metricsReg, audit.DefaultPipelineConfig())
 	auditH := audit.NewHandler(auditRepo, auditPipe, cfg)
+	auditH.SetMetricsRegistry(metricsReg)
+	benchRunner := benchmark.NewRunner(discovery, benchmarkRepo, auditPipe, "lockguard-raft-cluster")
 	diagService := recovery.NewDiagnosticsService(cfg.Raft.NodeID, serviceName, discovery, db, migrator, auditPipe)
+	diagService.SetMetricsRegistry(metricsReg)
+	diagService.SetEnvironment(cfg.Environment)
 
 	adminToken := "admin"
 	if envTok := cfg.Auth.APITokenSalt; envTok != "" {
@@ -130,23 +141,83 @@ func NewServer(cfg *config.Config, logger *slog.Logger, serviceName, version str
 	rateLimiter := middleware.NewRateLimiter(200.0, 400.0, 10000, metricsReg)
 	loginLimiter := middleware.NewRateLimiter(10.0, 20.0, 1000, metricsReg)
 
+	hbMgr.SetAuditCallback(func(eventType, clientID, ownerID, sessionID, status, errorCode string, meta map[string]interface{}) {
+		if auditPipe == nil {
+			return
+		}
+		auditPipe.RecordEvent(&audit.Event{
+			EventType:       eventType,
+			EventCategory:   audit.CategorySessionLifecycle,
+			ClientID:        clientID,
+			OwnerID:         ownerID,
+			OperationStatus: status,
+			ErrorCode:       errorCode,
+			CoordinatorID:   cfg.Raft.NodeID,
+			EventTimestamp:  time.Now().UTC(),
+			Metadata:        meta,
+		})
+	})
+
+	renewalMgr.SetAuditCallback(func(eventType, resourceName, ownerID, clientID, status, errorCode string, fencingToken, leaseVersion uint64, meta map[string]interface{}) {
+		if auditPipe == nil {
+			return
+		}
+		auditPipe.RecordEvent(&audit.Event{
+			EventType:       eventType,
+			EventCategory:   audit.CategoryRenewalLifecycle,
+			ResourceID:      resourceName,
+			OwnerID:         ownerID,
+			ClientID:        clientID,
+			FencingToken:    fencingToken,
+			LeaseVersion:    leaseVersion,
+			OperationStatus: status,
+			ErrorCode:       errorCode,
+			CoordinatorID:   cfg.Raft.NodeID,
+			EventTimestamp:  time.Now().UTC(),
+			Metadata:        meta,
+		})
+	})
+
+	authMiddleware.SetAuditCallback(func(eventType, actorID, role, endpoint, reason string) {
+		if auditPipe == nil {
+			return
+		}
+		auditPipe.RecordEvent(&audit.Event{
+			EventType:       eventType,
+			EventCategory:   audit.CategorySecurity,
+			OwnerID:         actorID,
+			ClientID:        actorID,
+			OperationStatus: audit.StatusRejected,
+			ErrorCode:       reason,
+			CoordinatorID:   cfg.Raft.NodeID,
+			EventTimestamp:  time.Now().UTC(),
+			Metadata: map[string]interface{}{
+				"endpoint": endpoint,
+				"role":     role,
+				"reason":   reason,
+			},
+		})
+	})
+
 	s := &Server{
-		cfg:            cfg,
-		logger:         logger,
-		mux:            mux,
-		serviceName:    serviceName,
-		version:        version,
-		discovery:      discovery,
-		router:         router,
-		heartbeatMgr:   hbMgr,
-		renewalMgr:     renewalMgr,
-		metricsReg:     metricsReg,
-		db:             db,
-		migrator:       migrator,
-		auditRepo:      auditRepo,
-		auditPipeline:  auditPipe,
-		auditHandler:   auditH,
-		diagnostics:    diagService,
+		cfg:             cfg,
+		logger:          logger,
+		mux:             mux,
+		serviceName:     serviceName,
+		version:         version,
+		discovery:       discovery,
+		router:          router,
+		heartbeatMgr:    hbMgr,
+		renewalMgr:      renewalMgr,
+		metricsReg:      metricsReg,
+		db:              db,
+		migrator:        migrator,
+		auditRepo:       auditRepo,
+		auditPipeline:   auditPipe,
+		auditHandler:    auditH,
+		benchmarkRepo:   benchmarkRepo,
+		benchmarkRunner: benchRunner,
+		diagnostics:     diagService,
 		authService:    authService,
 		authMiddleware: authMiddleware,
 		rateLimiter:    rateLimiter,
@@ -192,22 +263,29 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/auth/login", s.handleLogin)
 	s.mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
 
+	var dbChecker DatabaseChecker
+	if s.db != nil {
+		dbChecker = s.db
+	}
+
 	// Top-level Health & Readiness probes
 	s.mux.HandleFunc("/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
-	s.mux.HandleFunc("/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
+	s.mux.HandleFunc("/ready", ReadinessHandlerWithDB(s.cfg, s.serviceName, s.cfg.Raft.NodeID, dbChecker, s.discovery))
 	s.mux.HandleFunc("/metrics", s.metricsReg.Handler())
 
 	// Versioned Health & Readiness routes under /v1/ and /api/v1/
 	s.mux.HandleFunc("/v1/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
-	s.mux.HandleFunc("/v1/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
+	s.mux.HandleFunc("/v1/ready", ReadinessHandlerWithDB(s.cfg, s.serviceName, s.cfg.Raft.NodeID, dbChecker, s.discovery))
 	s.mux.HandleFunc("/v1/metrics", s.metricsReg.Handler())
 	s.mux.HandleFunc("/api/v1/health", HealthHandler(s.serviceName, s.version, s.cfg.Raft.NodeID))
-	s.mux.HandleFunc("/api/v1/ready", ReadinessHandler(s.cfg, s.serviceName, s.cfg.Raft.NodeID, s.discovery))
+	s.mux.HandleFunc("/api/v1/ready", ReadinessHandlerWithDB(s.cfg, s.serviceName, s.cfg.Raft.NodeID, dbChecker, s.discovery))
 	s.mux.HandleFunc("/api/v1/metrics", s.metricsReg.Handler())
 
-	// Cluster topology and invariant status
+	// Cluster topology, invariant status, and masked runtime architecture configuration
 	s.mux.HandleFunc("/v1/cluster/status", s.handleClusterStatus)
 	s.mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
+	s.mux.HandleFunc("/v1/cluster/config", s.handleClusterConfig)
+	s.mux.HandleFunc("/api/v1/cluster/config", s.handleClusterConfig)
 
 	// Lock operations proxied to current Raft leader with audit logging
 	s.mux.HandleFunc("/v1/locks", s.handleLockOperation)
@@ -215,27 +293,49 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/locks", s.handleLockOperation)
 	s.mux.HandleFunc("/api/v1/locks/", s.handleLockOperation)
 
-	// Client session and heartbeat management
+	// Client session, heartbeat, and automated lease renewal management
+	clientRenewalMux := http.NewServeMux()
 	hbHandler := heartbeat.NewHandler(s.heartbeatMgr)
-	hbHandler.RegisterRoutes(s.mux)
-	s.mux.HandleFunc("/api/v1/clients/register", s.stripAPIPrefix(hbHandler))
-	s.mux.HandleFunc("/api/v1/clients/heartbeat", s.stripAPIPrefix(hbHandler))
-	s.mux.HandleFunc("/api/v1/clients", s.stripAPIPrefix(hbHandler))
-	s.mux.HandleFunc("/api/v1/clients/", s.stripAPIPrefix(hbHandler))
-
-	// Automated lease renewal management
+	hbHandler.RegisterRoutes(clientRenewalMux)
 	renewalHandler := renewal.NewHandler(s.renewalMgr)
-	renewalHandler.RegisterRoutes(s.mux)
-	s.mux.HandleFunc("/api/v1/renewal/start", s.stripAPIPrefix(renewalHandler))
-	s.mux.HandleFunc("/api/v1/renewal/stop", s.stripAPIPrefix(renewalHandler))
-	s.mux.HandleFunc("/api/v1/renewal/status", s.stripAPIPrefix(renewalHandler))
+	renewalHandler.RegisterRoutes(clientRenewalMux)
+
+	protectedCR := s.protectClientAndRenewal(clientRenewalMux)
+	s.mux.HandleFunc("/v1/clients/register", protectedCR)
+	s.mux.HandleFunc("/v1/clients/heartbeat", protectedCR)
+	s.mux.HandleFunc("/v1/clients", protectedCR)
+	s.mux.HandleFunc("/v1/clients/", protectedCR)
+	s.mux.HandleFunc("/v1/renewal/start", protectedCR)
+	s.mux.HandleFunc("/v1/renewal/stop", protectedCR)
+	s.mux.HandleFunc("/v1/renewal/status", protectedCR)
+
+	s.mux.HandleFunc("/api/v1/clients/register", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/clients/heartbeat", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/clients", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/clients/", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/renewal/start", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/renewal/stop", s.stripAPIPrefix(protectedCR))
+	s.mux.HandleFunc("/api/v1/renewal/status", s.stripAPIPrefix(protectedCR))
 
 	// Phase 3 Audit Query API
 	s.auditHandler.RegisterRoutes(s.mux)
 
 	// Phase 3 & Phase 4 Operational Recovery and Diagnostics API
 	recoveryH := recovery.NewHandler(s.diagnostics)
-	recoveryH.RegisterRoutes(s.mux)
+	adminOnly := func(next http.Handler) http.Handler {
+		return s.authMiddleware.Authenticate(s.authMiddleware.RequireRole(auth.RoleAdmin)(next))
+	}
+	readAuth := func(next http.Handler) http.Handler {
+		if !s.cfg.Auth.Enabled {
+			return next
+		}
+		return s.authMiddleware.Authenticate(next)
+	}
+	recoveryH.RegisterRoutesWithAuth(s.mux, adminOnly)
+
+	// Live Benchmark Runner & Persisted Results API
+	benchH := benchmark.NewHandler(s.benchmarkRunner)
+	benchH.RegisterRoutesWithAuth(s.mux, readAuth, adminOnly)
 
 	// Phase 5 Admin Endpoints (RBAC protected)
 	adminNodesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -309,6 +409,23 @@ func (s *Server) registerRoutes() {
 			"owner_id":      req.OwnerID,
 			"fencing_token": req.FencingToken,
 		})
+		if claims, ok := auth.ClaimsFromContext(r.Context()); ok && s.auditPipeline != nil {
+			s.auditPipeline.RecordEvent(&audit.Event{
+				EventType:       audit.TypeAdminEmergencyUnlock,
+				EventCategory:   audit.CategoryAdministration,
+				ResourceID:      req.ResourceName,
+				OwnerID:         claims.Subject,
+				ClientID:        req.OwnerID,
+				FencingToken:    req.FencingToken,
+				OperationStatus: audit.StatusCommitted,
+				CoordinatorID:   s.cfg.Raft.NodeID,
+				EventTimestamp:  time.Now().UTC(),
+				Metadata: map[string]interface{}{
+					"admin_actor":  claims.Subject,
+					"target_owner": req.OwnerID,
+				},
+			})
+		}
 		r.Body = io.NopCloser(bytes.NewReader(releasePayload))
 		r.URL.Path = "/v1/locks/release"
 		s.handleLockOperation(w, r)
@@ -340,6 +457,32 @@ func (s *Server) registerRoutes() {
 			return
 		}
 		defer resp.Body.Close()
+
+		if s.auditPipeline != nil {
+			actor := "admin"
+			if claims, ok := auth.ClaimsFromContext(r.Context()); ok {
+				actor = claims.Subject
+			}
+			opStatus := audit.StatusCommitted
+			if resp.StatusCode >= 400 {
+				opStatus = audit.StatusFailed
+			}
+			s.auditPipeline.RecordEvent(&audit.Event{
+				EventType:       audit.TypeAdminStepdown,
+				EventCategory:   audit.CategoryAdministration,
+				OwnerID:         actor,
+				ClientID:        actor,
+				OperationStatus: opStatus,
+				CoordinatorID:   leaderURL,
+				EventTimestamp:  time.Now().UTC(),
+				Metadata: map[string]interface{}{
+					"admin_actor": actor,
+					"leader_url":  leaderURL,
+					"status_code": resp.StatusCode,
+				},
+			})
+		}
+
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -353,6 +496,127 @@ func (s *Server) stripAPIPrefix(handler interface{}) http.HandlerFunc {
 		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
 		s.mux.ServeHTTP(w, r)
 	}
+}
+
+func (s *Server) protectClientAndRenewal(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.cfg.Auth.Enabled && r.Header.Get("Authorization") == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		s.authMiddleware.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims, ok := auth.ClaimsFromContext(r.Context())
+			if !ok {
+				RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+				return
+			}
+
+			isMutation := r.Method == http.MethodPost || r.Method == http.MethodDelete || r.Method == http.MethodPut
+			if claims.Role == auth.RoleReadOnly && isMutation {
+				s.metricsReg.IncAuthzDenial(claims.Role)
+				s.recordSecurityAudit(audit.TypeAuthzDenial, claims.Subject, claims.Role, r.URL.Path, "read_only_client_renewal_denied")
+				RespondError(w, http.StatusForbidden, ErrCodeForbidden, "read-only role cannot execute client or renewal mutations", nil)
+				return
+			}
+
+			if claims.Role == auth.RoleClient && isMutation {
+				pathLower := strings.ToLower(r.URL.Path)
+				if r.Method == http.MethodDelete && strings.HasPrefix(pathLower, "/v1/clients/") {
+					clientID := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/v1/clients/"))
+					if clientID != "" {
+						if sess, found := s.heartbeatMgr.GetSession(clientID); found && !strings.EqualFold(sess.OwnerID(), claims.Subject) {
+							s.metricsReg.IncAuthzDenial(claims.Role)
+							s.metricsReg.IncSecurityViolation("cross_client_session_access")
+							s.recordSecurityAudit(audit.TypeAuthzDenial, claims.Subject, claims.Role, r.URL.Path, "cross_client_session_access")
+							RespondError(w, http.StatusForbidden, ErrCodeOwnerMismatch, "authenticated identity mismatch with session owner", nil)
+							return
+						}
+					}
+				} else if r.Body != nil {
+					bodyBytes, err := io.ReadAll(r.Body)
+					if err != nil {
+						RespondError(w, http.StatusBadRequest, ErrCodeBadRequest, "failed to read request body", nil)
+						return
+					}
+					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+					if len(bodyBytes) > 0 {
+						var payload struct {
+							OwnerID      string `json:"owner_id"`
+							ClientID     string `json:"client_id"`
+							ResourceName string `json:"resource_name"`
+						}
+						if err := json.Unmarshal(bodyBytes, &payload); err == nil {
+							var targetOwner string
+							switch {
+							case strings.HasSuffix(pathLower, "/heartbeat"):
+								if sess, found := s.heartbeatMgr.GetSession(strings.TrimSpace(payload.ClientID)); found {
+									targetOwner = sess.OwnerID()
+								}
+							case strings.HasSuffix(pathLower, "/renewal/stop"):
+								if st, found := s.renewalMgr.GetStatus(strings.TrimSpace(payload.ResourceName)); found {
+									targetOwner = st.OwnerID
+								}
+							default:
+								targetOwner = strings.TrimSpace(payload.OwnerID)
+								if targetOwner == "" && payload.ClientID != "" {
+									if sess, found := s.heartbeatMgr.GetSession(strings.TrimSpace(payload.ClientID)); found {
+										targetOwner = sess.OwnerID()
+									} else {
+										targetOwner = strings.TrimSpace(payload.ClientID)
+									}
+								}
+							}
+							if targetOwner != "" && !strings.EqualFold(targetOwner, claims.Subject) {
+								s.metricsReg.IncAuthzDenial(claims.Role)
+								s.metricsReg.IncSecurityViolation("cross_client_session_access")
+								s.recordSecurityAudit(audit.TypeAuthzDenial, claims.Subject, claims.Role, r.URL.Path, "cross_client_session_access")
+								RespondError(w, http.StatusForbidden, ErrCodeOwnerMismatch, "authenticated identity mismatch with requested owner ID", nil)
+								return
+							}
+						}
+					}
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})).ServeHTTP(w, r)
+	}
+}
+
+func (s *Server) validateLeaseTTL(ttlSec, ttlNano int64) error {
+	if s.cfg == nil {
+		return nil
+	}
+	if ttlSec < 0 || ttlNano < 0 {
+		return fmt.Errorf("lease TTL must be positive")
+	}
+	var effNano int64
+	if ttlNano > 0 {
+		effNano = ttlNano
+	} else if ttlSec > 0 {
+		if ttlSec > math.MaxInt64/int64(time.Second) {
+			return fmt.Errorf("lease TTL exceeds maximum representable duration")
+		}
+		effNano = ttlSec * int64(time.Second)
+	}
+	if effNano == 0 {
+		return nil
+	}
+	if s.cfg.Lease.MinTTLSec > 0 {
+		minNano := int64(s.cfg.Lease.MinTTLSec) * int64(time.Second)
+		if effNano < minNano {
+			return fmt.Errorf("requested lease TTL %s is below minimum allowed %ds", time.Duration(effNano), s.cfg.Lease.MinTTLSec)
+		}
+	}
+	if s.cfg.Lease.MaxTTLSec > 0 {
+		maxNano := int64(s.cfg.Lease.MaxTTLSec) * int64(time.Second)
+		if effNano > maxNano {
+			return fmt.Errorf("requested lease TTL %s exceeds maximum allowed %ds", time.Duration(effNano), s.cfg.Lease.MaxTTLSec)
+		}
+	}
+	return nil
 }
 
 type responseRecorder struct {
@@ -394,6 +658,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.authService.Authenticate(req.Username, req.Password)
 	if err != nil {
 		s.metricsReg.IncAuthFailure("invalid_credentials")
+		s.recordSecurityAudit(audit.TypeAuthFailure, req.Username, "", r.URL.Path, "invalid_credentials")
 		RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "invalid username or password", nil)
 		return
 	}
@@ -418,19 +683,33 @@ func (s *Server) handleLockOperation(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	// Security Verification: If Authorization header provided or strict production mode enabled
+	// Security Verification: Enforce JWT authentication whenever Auth.Enabled is true or Authorization header is supplied
 	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" || (s.cfg.Auth.Enabled && s.cfg.Environment == "production") {
+	if authHeader != "" || s.cfg.Auth.Enabled {
 		if authHeader == "" {
 			s.metricsReg.IncAuthFailure("missing_header")
+			s.recordSecurityAudit(audit.TypeAuthFailure, "", "", r.URL.Path, "missing_header")
 			RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
 			return
 		}
 
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || strings.TrimSpace(parts[1]) == "" {
+			s.metricsReg.IncAuthFailure("invalid_format")
+			s.recordSecurityAudit(audit.TypeAuthFailure, "", "", r.URL.Path, "invalid_format")
+			RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "invalid authorization header format (expected 'Bearer <token>')", nil)
+			return
+		}
+
+		tokenStr := strings.TrimSpace(parts[1])
 		claims, err := s.authService.ValidateToken(tokenStr)
 		if err != nil {
-			s.metricsReg.IncAuthFailure("invalid_token")
+			reason := "invalid_token"
+			if err == auth.ErrExpiredToken {
+				reason = "expired_token"
+			}
+			s.metricsReg.IncAuthFailure(reason)
+			s.recordSecurityAudit(audit.TypeAuthFailure, "", "", r.URL.Path, reason)
 			RespondError(w, http.StatusUnauthorized, ErrCodeUnauthorized, err.Error(), nil)
 			return
 		}
@@ -439,6 +718,7 @@ func (s *Server) handleLockOperation(w http.ResponseWriter, r *http.Request) {
 		// RBAC: ReadOnly role cannot execute mutating operations
 		if claims.Role == auth.RoleReadOnly && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
 			s.metricsReg.IncAuthzDenial(claims.Role)
+			s.recordSecurityAudit(audit.TypeAuthzDenial, claims.Subject, claims.Role, r.URL.Path, "read_only_mutation_denied")
 			RespondError(w, http.StatusForbidden, ErrCodeForbidden, "read-only role cannot execute lock mutations", nil)
 			return
 		}
@@ -453,9 +733,25 @@ func (s *Server) handleLockOperation(w http.ResponseWriter, r *http.Request) {
 				if payload.OwnerID != "" && !strings.EqualFold(payload.OwnerID, claims.Subject) {
 					s.metricsReg.IncAuthzDenial(claims.Role)
 					s.metricsReg.IncSecurityViolation("cross_client_lock_access")
+					s.recordSecurityAudit(audit.TypeAuthzDenial, claims.Subject, claims.Role, r.URL.Path, "cross_client_lock_access")
 					RespondError(w, http.StatusForbidden, ErrCodeOwnerMismatch, "authenticated identity mismatch with requested owner ID", nil)
 					return
 				}
+			}
+		}
+	}
+
+	// Enforce configured lease TTL bounds on acquire/renew operations before forwarding to coordinator
+	pathLower := strings.ToLower(r.URL.Path)
+	if r.Method == http.MethodPost && (strings.HasSuffix(pathLower, "/acquire") || strings.HasSuffix(pathLower, "/renew")) && len(bodyBytes) > 0 {
+		var ttlReq struct {
+			TTLSeconds     int64 `json:"ttl_seconds"`
+			TTLNanoseconds int64 `json:"ttl_nanoseconds"`
+		}
+		if err := json.Unmarshal(bodyBytes, &ttlReq); err == nil {
+			if err := s.validateLeaseTTL(ttlReq.TTLSeconds, ttlReq.TTLNanoseconds); err != nil {
+				RespondError(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error(), nil)
+				return
 			}
 		}
 	}
@@ -651,9 +947,106 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	RespondSuccess(w, http.StatusOK, status)
 }
 
+func (s *Server) recordSecurityAudit(eventType, actor, role, path, reason string) {
+	if s.auditPipeline == nil {
+		return
+	}
+	s.auditPipeline.RecordEvent(&audit.Event{
+		EventType:       eventType,
+		EventCategory:   audit.CategorySecurity,
+		OwnerID:         actor,
+		ClientID:        actor,
+		OperationStatus: audit.StatusRejected,
+		ErrorCode:       reason,
+		CoordinatorID:   s.cfg.Raft.NodeID,
+		EventTimestamp:  time.Now().UTC(),
+		Metadata: map[string]interface{}{
+			"endpoint": path,
+			"role":     role,
+			"reason":   reason,
+		},
+	})
+}
+
+func (s *Server) handleClusterConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		RespondError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+
+	var quorumRule string
+	n := len(s.cfg.Gateway.CoordinatorEndpoints)
+	if n > 0 {
+		quorumRule = fmt.Sprintf("%d of %d coordinators (Strict Majority, Fail Closed)", (n/2)+1, n)
+	} else {
+		quorumRule = "2 of 3 coordinators (Strict Majority, Fail Closed)"
+	}
+
+	var leaderID, leaderURL string
+	var clusterReport *recovery.ClusterRecoveryReport
+	if s.diagnostics != nil {
+		rep := s.diagnostics.CollectClusterReport(r.Context())
+		clusterReport = &rep
+		leaderID = rep.CurrentLeaderID
+		leaderURL = rep.CurrentLeaderURL
+	}
+
+	storageMode := "Unavailable"
+	if s.db != nil {
+		storageMode = fmt.Sprintf("PostgreSQL %s:%d/%s (SSL: %s)", s.cfg.DB.Host, s.cfg.DB.Port, s.cfg.DB.DBName, s.cfg.DB.SSLMode)
+	}
+
+	RespondSuccess(w, http.StatusOK, map[string]interface{}{
+		"consensus_engine": map[string]interface{}{
+			"protocol":               "HashiCorp Raft (github.com/hashicorp/raft v1.7.2)",
+			"storage_engine":         "BoltDB (raft-boltdb v2) + Snapshot FileStore",
+			"quorum_rule":            quorumRule,
+			"heartbeat_timeout_ms":   s.cfg.Raft.HeartbeatTimeout.Milliseconds(),
+			"election_timeout_ms":    s.cfg.Raft.ElectionTimeout.Milliseconds(),
+			"snapshot_interval_sec":  int(s.cfg.Raft.SnapshotIntervalSec.Seconds()),
+			"snapshot_threshold":     s.cfg.Raft.SnapshotThreshold,
+			"mtls_enabled":           s.cfg.Raft.EnableTLS,
+			"current_leader_id":      leaderID,
+			"current_leader_url":     leaderURL,
+			"coordinators_endpoints": s.cfg.Gateway.CoordinatorEndpoints,
+		},
+		"lease_policy": map[string]interface{}{
+			"default_ttl_sec":        s.cfg.Lease.DefaultTTLSec,
+			"min_ttl_sec":            s.cfg.Lease.MinTTLSec,
+			"max_ttl_sec":            s.cfg.Lease.MaxTTLSec,
+			"heartbeat_interval_ms":  s.cfg.Heartbeat.Interval.Milliseconds(),
+			"heartbeat_timeout_sec":  int(s.cfg.Heartbeat.Timeout.Seconds()),
+			"renewal_safety_margin":  s.cfg.Renewal.SafetyMargin.String(),
+		},
+		"security": map[string]interface{}{
+			"auth_enabled":          s.cfg.Auth.Enabled,
+			"jwt_algorithm":         "HS256",
+			"jwt_expiration_hours":  s.cfg.Auth.JWTExpirationH,
+			"jwt_secret_configured": len(s.cfg.Auth.JWTSecretKey) > 0,
+			"rbac_roles":            []string{auth.RoleAdmin, auth.RoleClient, auth.RoleReadOnly},
+		},
+		"runtime": map[string]interface{}{
+			"environment":             s.cfg.Environment,
+			"service_name":            s.serviceName,
+			"version":                 s.version,
+			"api_listen":              fmt.Sprintf("%s:%d", s.cfg.HTTP.Host, s.cfg.HTTP.Port),
+			"database_target":         storageMode,
+			"protected_resource_url":  "http://protected-resource:9000",
+			"coordinator_count":       n,
+			"cluster_snapshot":        clusterReport,
+		},
+	})
+}
+
 // Start begins listening on the configured address and starts background scrubbers.
 func (s *Server) Start() error {
 	s.heartbeatMgr.Start()
+	monCtx, cancel := context.WithCancel(context.Background())
+	s.monitorCancel = cancel
+	if s.diagnostics != nil {
+		s.diagnostics.StartMonitor(monCtx, 400*time.Millisecond)
+	}
+	go s.runLeaseReaper(monCtx)
 	if s.auditPipeline != nil {
 		s.auditPipeline.Start()
 		s.auditPipeline.RecordEvent(&audit.Event{
@@ -681,6 +1074,9 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the HTTP server, renewal manager, audit pipeline, and heartbeat scrubber.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("server_shutting_down", slog.String("service", s.serviceName))
+	if s.monitorCancel != nil {
+		s.monitorCancel()
+	}
 	if s.router != nil {
 		s.router.Close()
 	}
@@ -745,24 +1141,140 @@ func (s *Server) Database() *persistence.Database {
 	return s.db
 }
 
-// SetDatabase updates the database handle, migrator, audit repo, and diagnostics references.
+// SetDatabase updates the database handle, migrator, audit repo, benchmark repo, and diagnostics references.
 func (s *Server) SetDatabase(db *persistence.Database) {
 	s.db = db
 	if db != nil {
 		s.migrator = persistence.NewMigrator(db)
 		s.auditRepo = persistence.NewPostgresAuditRepo(db)
+		s.benchmarkRepo = persistence.NewPostgresBenchmarkRepo(db)
 		if s.auditHandler != nil {
 			s.auditHandler.SetRepository(s.auditRepo)
+		}
+		if s.benchmarkRunner != nil {
+			s.benchmarkRunner.SetRepository(s.benchmarkRepo)
 		}
 	} else {
 		s.migrator = nil
 		s.auditRepo = nil
+		s.benchmarkRepo = nil
 		if s.auditHandler != nil {
 			s.auditHandler.SetRepository(nil)
+		}
+		if s.benchmarkRunner != nil {
+			s.benchmarkRunner.SetRepository(nil)
 		}
 	}
 	if s.diagnostics != nil {
 		s.diagnostics.SetDatabase(db, s.migrator)
+	}
+}
+
+func (s *Server) runLeaseReaper(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reapExpiredLeases(ctx, client)
+		}
+	}
+}
+
+func (s *Server) reapExpiredLeases(ctx context.Context, client *http.Client) {
+	if s.discovery == nil {
+		return
+	}
+	leaderURL, err := s.discovery.GetLeader(ctx)
+	if err != nil || leaderURL == "" {
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, leaderURL+"/v1/locks?include_expired=true&stale=false", nil)
+	if err != nil {
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var listRes struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Locks []struct {
+				ResourceName      string `json:"resource_name"`
+				OwnerID           string `json:"owner_id"`
+				FencingToken      uint64 `json:"fencing_token"`
+				LeaseVersion      uint64 `json:"lease_version"`
+				ExpiresAtUnixNano int64  `json:"expires_at_unix_nano"`
+				Status            string `json:"status"`
+			} `json:"locks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &listRes); err != nil || !listRes.Success {
+		return
+	}
+
+	nowNs := time.Now().UnixNano()
+	for _, lock := range listRes.Data.Locks {
+		if ctx.Err() != nil {
+			return
+		}
+		if lock.Status != "EXPIRED" && (lock.ExpiresAtUnixNano <= 0 || nowNs < lock.ExpiresAtUnixNano) {
+			continue
+		}
+
+		reqID := fmt.Sprintf("reap-%s-%d-%d", lock.ResourceName, lock.FencingToken, lock.LeaseVersion)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"request_id":                    reqID,
+			"resource_name":                 lock.ResourceName,
+			"expected_owner_id":             lock.OwnerID,
+			"expected_fencing_token":        lock.FencingToken,
+			"expected_lease_version":        lock.LeaseVersion,
+			"expected_expires_at_unix_nano": lock.ExpiresAtUnixNano,
+			"timestamp_unix_nano":           nowNs,
+		})
+		expReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, leaderURL+"/v1/locks/expire", bytes.NewReader(payload))
+		if reqErr != nil {
+			continue
+		}
+		expReq.Header.Set("Content-Type", "application/json")
+		expResp, doErr := client.Do(expReq)
+		if doErr != nil {
+			continue
+		}
+		_, _ = io.Copy(io.Discard, expResp.Body)
+		_ = expResp.Body.Close()
+
+		if expResp.StatusCode == http.StatusOK && s.auditPipeline != nil {
+			s.auditPipeline.RecordEvent(&audit.Event{
+				EventType:       audit.TypeLockExpire,
+				EventCategory:   audit.CategoryLockOperation,
+				RequestID:       reqID,
+				ResourceID:      lock.ResourceName,
+				OwnerID:         lock.OwnerID,
+				ClientID:        lock.OwnerID,
+				FencingToken:    lock.FencingToken,
+				LeaseVersion:    lock.LeaseVersion,
+				OperationStatus: audit.StatusCommitted,
+				CoordinatorID:   leaderURL,
+				EventTimestamp:  time.Now().UTC(),
+				Metadata: map[string]interface{}{
+					"reason":               "lease_ttl_elapsed",
+					"expired_at_unix_nano": lock.ExpiresAtUnixNano,
+				},
+			})
+		}
 	}
 }
 

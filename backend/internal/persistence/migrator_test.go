@@ -66,13 +66,13 @@ func TestConcurrentMigrationsAgainstRealPostgres(t *testing.T) {
 		}
 	}
 
-	// 3. Verify exactly 2 migrations recorded
+	// 3. Verify all 3 migrations recorded (001_init_audit, 002_operational_tables, 003_create_benchmark_tables)
 	status, err := migrator1.GetMigrationStatus(context.Background())
 	if err != nil {
 		t.Fatalf("failed to get migration status: %v", err)
 	}
-	if len(status) != 2 {
-		t.Fatalf("expected 2 migrations, got %d", len(status))
+	if len(status) != 3 {
+		t.Fatalf("expected 3 migrations, got %d", len(status))
 	}
 	for _, m := range status {
 		if !m.Applied {

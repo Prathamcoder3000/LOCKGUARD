@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,7 +39,26 @@ func main() {
 	}
 
 	guard := internal.NewFencingGuard()
+	var writesAccepted atomic.Uint64
+	var writesRejected atomic.Uint64
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprintf(w, "# HELP lockguard_protected_resource_up Protected resource service liveness status.\n")
+		fmt.Fprintf(w, "# TYPE lockguard_protected_resource_up gauge\n")
+		fmt.Fprintf(w, "lockguard_protected_resource_up 1\n")
+		fmt.Fprintf(w, "# HELP lockguard_protected_resource_writes_accepted_total Total writes accepted with valid fencing tokens.\n")
+		fmt.Fprintf(w, "# TYPE lockguard_protected_resource_writes_accepted_total counter\n")
+		fmt.Fprintf(w, "lockguard_protected_resource_writes_accepted_total %d\n", writesAccepted.Load())
+		fmt.Fprintf(w, "# HELP lockguard_protected_resource_writes_rejected_total Total writes rejected due to stale or conflicting fencing tokens.\n")
+		fmt.Fprintf(w, "# TYPE lockguard_protected_resource_writes_rejected_total counter\n")
+		fmt.Fprintf(w, "lockguard_protected_resource_writes_rejected_total %d\n", writesRejected.Load())
+	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -68,6 +88,7 @@ func main() {
 		}
 
 		if err := guard.ValidateAndApply(req.ResourceName, req.FencingToken, req.OwnerID); err != nil {
+			writesRejected.Add(1)
 			logger.Warn("fencing_token_rejected",
 				slog.String("resource", req.ResourceName),
 				slog.Uint64("token", req.FencingToken),
@@ -86,6 +107,7 @@ func main() {
 			return
 		}
 
+		writesAccepted.Add(1)
 		logger.Info("fencing_write_accepted",
 			slog.String("resource", req.ResourceName),
 			slog.Uint64("token", req.FencingToken),

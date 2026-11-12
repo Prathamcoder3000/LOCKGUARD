@@ -2,12 +2,16 @@ package recovery
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"lockguard/backend/internal/audit"
+	"lockguard/backend/internal/gateway"
+	"lockguard/backend/internal/metrics"
 )
 
 func TestDiagnosticsQuorumLossCausesUnhealthy(t *testing.T) {
@@ -102,6 +106,56 @@ func TestRecoveryEndpoints_DiagnosticsAndHealth(t *testing.T) {
 
 	if wSnap.Code != http.StatusOK {
 		t.Errorf("expected 200 OK for snapshot status, got %d", wSnap.Code)
+	}
+}
+
+func TestCollectClusterReport_UnreachableNodesAndQuorumLoss(t *testing.T) {
+	liveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"node_id":"coordinator-a","state":"Leader","is_leader":true,"leader_id":"coordinator-a"}}`))
+	}))
+	defer liveSrv.Close()
+
+	deadSrv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL1 := deadSrv1.URL
+	deadSrv1.Close()
+
+	deadSrv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL2 := deadSrv2.URL
+	deadSrv2.Close()
+
+	disc := gateway.NewLeaderDiscovery([]string{liveSrv.URL, deadURL1, deadURL2}, time.Second, nil, metrics.NewRegistry())
+	diag := NewDiagnosticsService("gw-test", "lockguard-api", disc, nil, nil, nil)
+
+	report := diag.CollectClusterReport(context.Background())
+
+	if report.TotalNodes != 3 {
+		t.Fatalf("expected 3 total nodes, got %d", report.TotalNodes)
+	}
+	if report.QuorumAvailable {
+		t.Fatalf("expected QuorumAvailable=false when 2 of 3 coordinators are down")
+	}
+	if report.QuorumState != "QUORUM_LOST" {
+		t.Fatalf("expected QuorumState=QUORUM_LOST, got %s", report.QuorumState)
+	}
+	if report.CurrentLeaderID != "" || report.CurrentLeaderURL != "" {
+		t.Fatalf("expected leader cleared on quorum loss, got id=%q url=%q", report.CurrentLeaderID, report.CurrentLeaderURL)
+	}
+	if report.AvailableNodes == nil || len(report.AvailableNodes) != 1 || report.AvailableNodes[0] != "coordinator-a" {
+		t.Fatalf("expected non-nil AvailableNodes [coordinator-a], got %#v", report.AvailableNodes)
+	}
+	for i, c := range report.Coordinators {
+		if strings.TrimSpace(c.NodeID) == "" {
+			t.Fatalf("expected non-empty fallback NodeID at index %d for endpoint %s", i, c.Endpoint)
+		}
+	}
+
+	rawJSON, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("failed to marshal report: %v", err)
+	}
+	if strings.Contains(string(rawJSON), `"available_nodes":null`) {
+		t.Fatalf("expected non-null available_nodes array in JSON, got %s", string(rawJSON))
 	}
 }
 

@@ -5,6 +5,7 @@ import { ProtectedRoute } from '../components/ProtectedRoute';
 import { OverviewPage } from '../pages/OverviewPage';
 import { LocksPage } from '../pages/LocksPage';
 import { ClusterPage } from '../pages/ClusterPage';
+import { ConsensusPage } from '../pages/ConsensusPage';
 import { AuditPage } from '../pages/AuditPage';
 import { ResiliencePage } from '../pages/ResiliencePage';
 import { BenchmarksPage } from '../pages/BenchmarksPage';
@@ -23,7 +24,7 @@ export const App: React.FC = () => {
           <Route path="/" element={<OverviewPage />} />
           <Route path="/locks" element={<LocksPage />} />
           <Route path="/cluster" element={<ClusterPage />} />
-          <Route path="/consensus" element={<ClusterPage />} />
+          <Route path="/consensus" element={<ConsensusPage />} />
           <Route path="/resilience" element={<ResiliencePage />} />
           <Route path="/audit" element={<AuditPage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />

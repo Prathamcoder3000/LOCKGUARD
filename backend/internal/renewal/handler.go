@@ -134,6 +134,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	authSessionID := r.Header.Get("X-Session-ID")
 	res := strings.TrimSpace(r.URL.Query().Get("resource"))
 	if res != "" {
 		st, found := h.manager.GetStatus(res)
@@ -141,15 +142,27 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusNotFound, "ERR_NOT_FOUND", "renewal worker not found", nil)
 			return
 		}
-		respondSuccess(w, http.StatusOK, st)
+		respondSuccess(w, http.StatusOK, sanitizeRenewalStatus(st, authSessionID))
 		return
 	}
 
 	statuses := h.manager.ListStatus()
+	sanitized := make([]RenewalStatus, len(statuses))
+	for i, st := range statuses {
+		sanitized[i] = sanitizeRenewalStatus(st, authSessionID)
+	}
 	respondSuccess(w, http.StatusOK, map[string]interface{}{
-		"renewals": statuses,
-		"count":    len(statuses),
+		"renewals": sanitized,
+		"count":    len(sanitized),
 	})
+}
+
+func sanitizeRenewalStatus(st RenewalStatus, authSessionID string) RenewalStatus {
+	if authSessionID != "" && st.SessionID == authSessionID {
+		return st
+	}
+	st.SessionID = "[REDACTED]"
+	return st
 }
 
 type successEnvelope struct {

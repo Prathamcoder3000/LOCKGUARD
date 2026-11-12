@@ -11,23 +11,40 @@ import (
 
 	"lockguard/backend/internal/auth"
 	"lockguard/backend/internal/config"
+	"lockguard/backend/internal/metrics"
 	"lockguard/backend/internal/persistence"
 )
 
 // Handler provides HTTP endpoints for querying audit logs and reviewing pipeline diagnostics.
 type Handler struct {
-	repo     persistence.AuditRepository
-	pipeline *Pipeline
-	cfg      *config.Config
+	repo       persistence.AuditRepository
+	pipeline   *Pipeline
+	cfg        *config.Config
+	metricsReg *metrics.Registry
 }
 
 // NewHandler creates a new audit Handler.
 func NewHandler(repo persistence.AuditRepository, pipeline *Pipeline, cfg *config.Config) *Handler {
 	return &Handler{
-		repo:     repo,
-		pipeline: pipeline,
-		cfg:      cfg,
+		repo:       repo,
+		pipeline:   pipeline,
+		cfg:        cfg,
+		metricsReg: metrics.DefaultRegistry,
 	}
+}
+
+// SetMetricsRegistry binds the metrics registry used for auth failure and authz denial telemetry.
+func (h *Handler) SetMetricsRegistry(reg *metrics.Registry) {
+	if reg != nil {
+		h.metricsReg = reg
+	}
+}
+
+func (h *Handler) reg() *metrics.Registry {
+	if h.metricsReg != nil {
+		return h.metricsReg
+	}
+	return metrics.DefaultRegistry
 }
 
 // SetRepository updates the audit repository under safe handler control.
@@ -55,58 +72,110 @@ type callerIdentity struct {
 	authenticated bool
 	isAdmin       bool
 	clientID      string
+	role          string
 }
 
 func (h *Handler) authenticate(r *http.Request) (callerIdentity, error) {
 	// If Auth is disabled, trusted intranet mode: all callers are allowed as admin/read-only
 	if h.cfg == nil || !h.cfg.Auth.Enabled {
 		callerClient := strings.TrimSpace(r.Header.Get("X-Client-ID"))
-		return callerIdentity{authenticated: true, isAdmin: callerClient == "", clientID: callerClient}, nil
+		role := auth.RoleAdmin
+		if callerClient != "" {
+			role = auth.RoleClient
+		}
+		return callerIdentity{authenticated: true, isAdmin: callerClient == "", clientID: callerClient, role: role}, nil
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
+		h.reg().IncAuthFailure("missing_header")
+		h.recordSecurityEvent(TypeAuthFailure, "", "", r.URL.Path, "missing_header")
 		return callerIdentity{}, errors.New("missing authorization header")
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+		h.reg().IncAuthFailure("invalid_format")
+		h.recordSecurityEvent(TypeAuthFailure, "", "", r.URL.Path, "invalid_format")
 		return callerIdentity{}, errors.New("invalid authorization header scheme, expected Bearer <token>")
 	}
 
 	token := strings.TrimSpace(parts[1])
 	if token == "" {
+		h.reg().IncAuthFailure("invalid_format")
+		h.recordSecurityEvent(TypeAuthFailure, "", "", r.URL.Path, "empty_bearer_token")
 		return callerIdentity{}, errors.New("empty bearer token")
 	}
 
 	// 1. Standard Phase 5 JWT validation
+	var jwtErr error
 	if h.cfg != nil && h.cfg.Auth.JWTSecretKey != "" {
-		if claims, err := auth.ValidateJWT(token, h.cfg.Auth.JWTSecretKey); err == nil {
+		var claims *auth.Claims
+		claims, jwtErr = auth.ValidateJWT(token, h.cfg.Auth.JWTSecretKey)
+		if jwtErr == nil {
 			if claims.Role == auth.RoleAdmin || claims.Role == auth.RoleReadOnly {
-				return callerIdentity{authenticated: true, isAdmin: true}, nil
+				h.reg().IncAuthSuccess(claims.Role)
+				return callerIdentity{authenticated: true, isAdmin: true, role: claims.Role}, nil
 			}
-			return callerIdentity{authenticated: true, isAdmin: false, clientID: claims.Subject}, nil
+			h.reg().IncAuthSuccess(claims.Role)
+			return callerIdentity{authenticated: true, isAdmin: false, clientID: claims.Subject, role: claims.Role}, nil
 		}
 	}
 
-	// 2. Administrative static credentials (development/intranet mode)
-	if token == "admin" || token == "operator" || token == h.cfg.Auth.JWTSecretKey {
-		return callerIdentity{authenticated: true, isAdmin: true}, nil
+	// 2. Administrative static credentials (only allowed in unit test / unset test harness mode)
+	isTestEnv := h.cfg == nil || h.cfg.Environment == "" || h.cfg.Environment == "test"
+	if isTestEnv {
+		if token == "admin" || token == "operator" || (h.cfg != nil && h.cfg.Auth.JWTSecretKey != "" && token == h.cfg.Auth.JWTSecretKey) {
+			h.reg().IncAuthSuccess(auth.RoleAdmin)
+			return callerIdentity{authenticated: true, isAdmin: true, role: auth.RoleAdmin}, nil
+		}
+
+		// Client-scoped test credentials (e.g. "client:<client_id>")
+		if strings.HasPrefix(token, "client:") {
+			cid := strings.TrimPrefix(token, "client:")
+			h.reg().IncAuthSuccess(auth.RoleClient)
+			return callerIdentity{authenticated: true, isAdmin: false, clientID: cid, role: auth.RoleClient}, nil
+		}
 	}
 
-	// Client-scoped credentials (e.g. "client:<client_id>")
-	if strings.HasPrefix(token, "client:") {
-		cid := strings.TrimPrefix(token, "client:")
-		return callerIdentity{authenticated: true, isAdmin: false, clientID: cid}, nil
+	reason := "invalid_token"
+	if errors.Is(jwtErr, auth.ErrExpiredToken) {
+		reason = "expired_token"
 	}
-
-	// If caller specified X-Client-ID header with a valid bearer token
-	callerClient := strings.TrimSpace(r.Header.Get("X-Client-ID"))
-	if callerClient != "" {
-		return callerIdentity{authenticated: true, isAdmin: false, clientID: callerClient}, nil
-	}
-
+	h.reg().IncAuthFailure(reason)
+	h.recordSecurityEvent(TypeAuthFailure, "", "", r.URL.Path, reason)
 	return callerIdentity{}, errors.New("unauthorized token")
+}
+
+func (h *Handler) recordSecurityEvent(eventType, actor, role, path, reason string) {
+	if h.pipeline == nil {
+		return
+	}
+	h.pipeline.RecordEvent(&Event{
+		EventType:       eventType,
+		EventCategory:   CategorySecurity,
+		OwnerID:         actor,
+		ClientID:        actor,
+		OperationStatus: StatusRejected,
+		ErrorCode:       reason,
+		CoordinatorID:   "api-gateway",
+		EventTimestamp:  time.Now().UTC(),
+		Metadata: map[string]interface{}{
+			"endpoint": path,
+			"role":     role,
+			"reason":   reason,
+		},
+	})
+}
+
+func (h *Handler) denyForbidden(w http.ResponseWriter, role, message string) {
+	if role == "" {
+		role = auth.RoleClient
+	}
+	h.reg().IncAuthzDenial(role)
+	h.reg().IncSecurityViolation("cross_client_audit_access")
+	h.recordSecurityEvent(TypeAuthzDenial, "", role, "/v1/audit", "cross_client_audit_access")
+	respondError(w, http.StatusForbidden, "ERR_FORBIDDEN", message, nil)
 }
 
 func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -130,13 +199,13 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Cross-client authorization enforcement
 	if !ident.isAdmin && ident.clientID != "" {
 		if filter.ClientID != "" && filter.ClientID != ident.clientID {
-			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			h.denyForbidden(w, ident.role,
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 			return
 		}
 		if filter.OwnerID != "" && filter.OwnerID != ident.clientID {
-			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			h.denyForbidden(w, ident.role,
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 			return
 		}
 		filter.ClientID = ident.clientID
@@ -200,8 +269,8 @@ func (h *Handler) handleEventByID(w http.ResponseWriter, r *http.Request) {
 
 	// Cross-client authorization check: non-admin cannot view another client's record
 	if !ident.isAdmin && ident.clientID != "" && event.ClientID != "" && event.ClientID != ident.clientID {
-		respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-			"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+		h.denyForbidden(w, ident.role,
+			"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 		return
 	}
 
@@ -239,13 +308,13 @@ func (h *Handler) handleResourceEvents(w http.ResponseWriter, r *http.Request) {
 	// Cross-client authorization enforcement: non-admin only sees their own events for the resource
 	if !ident.isAdmin && ident.clientID != "" {
 		if filter.ClientID != "" && filter.ClientID != ident.clientID {
-			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			h.denyForbidden(w, ident.role,
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 			return
 		}
 		if filter.OwnerID != "" && filter.OwnerID != ident.clientID {
-			respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-				"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+			h.denyForbidden(w, ident.role,
+				"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 			return
 		}
 		filter.ClientID = ident.clientID
@@ -295,8 +364,8 @@ func (h *Handler) handleClientEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Cross-client authorization check: non-admin cannot view another client's records
 	if !ident.isAdmin && ident.clientID != "" && ident.clientID != clientID {
-		respondError(w, http.StatusForbidden, "ERR_FORBIDDEN",
-			"cross-client audit access forbidden: client is not authorized to view another client's audit records", nil)
+		h.denyForbidden(w, ident.role,
+			"cross-client audit access forbidden: client is not authorized to view another client's audit records")
 		return
 	}
 

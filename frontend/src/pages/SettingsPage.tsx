@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Shield, Server, KeyRound, AlertTriangle, CheckCircle2, ArrowRightLeft, Lock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { clusterService } from '../services/clusterService';
+import { clusterService, ClusterRuntimeConfig } from '../services/clusterService';
 
 export const SettingsPage: React.FC = () => {
   const { user } = useAuth();
@@ -10,6 +11,22 @@ export const SettingsPage: React.FC = () => {
   const [emergencyResource, setEmergencyResource] = useState('');
   const [loading, setLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [runtimeConfig, setRuntimeConfig] = useState<ClusterRuntimeConfig | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    clusterService
+      .getConfig()
+      .then((cfg) => {
+        if (mounted) setRuntimeConfig(cfg);
+      })
+      .catch(() => {
+        // Non-blocking fallback when cluster config probe is unavailable
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const handleEmergencyUnlock = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -184,52 +201,88 @@ export const SettingsPage: React.FC = () => {
               <p className="font-semibold text-blue-900">Restricted Administrative Controls</p>
               <p className="mt-1 text-blue-700 leading-relaxed">
                 Emergency unlock and leadership stepdown are restricted to users with the <code>ADMIN</code> role.
-                As an Operator (<code>{user?.role}</code>), you can acquire, renew, and release your own locks in{' '}
-                <a href="/locks" className="font-semibold underline">
-                  Distributed Locks
-                </a>.
+                {(user?.role || '').toUpperCase() === 'READ_ONLY' ? (
+                  <> With the <code>READ_ONLY</code> role, you have inspect-only visibility across cluster leases, sessions, and audit trails.</>
+                ) : (
+                  <>
+                    {' '}As an Operator (<code>{user?.role}</code>), you can acquire, renew, and release your own locks in{' '}
+                    <Link to="/locks" className="font-semibold underline">
+                      Distributed Locks
+                    </Link>.
+                  </>
+                )}
               </p>
             </div>
           </div>
         </div>
       )}
 
-      {/* Cluster Topology Configuration Parameters (Read-Only) */}
+      {/* Cluster Topology Configuration Parameters (Live Backend Read-Only) */}
       <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-card">
-        <div className="flex items-center space-x-2 border-b border-slate-100 pb-3">
-          <Server className="h-5 w-5 text-slate-700" />
-          <h2 className="text-sm font-bold text-slate-900">Cluster Architecture Parameters</h2>
+        <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div className="flex items-center space-x-2">
+            <Server className="h-5 w-5 text-slate-700" />
+            <h2 className="text-sm font-bold text-slate-900">Cluster Architecture Parameters</h2>
+          </div>
+          <span className="text-[11px] font-mono text-slate-500">
+            GET /api/v1/cluster/config {runtimeConfig ? `(${runtimeConfig.runtime.environment})` : ''}
+          </span>
         </div>
 
         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
             <span className="text-slate-400">Consensus Engine</span>
-            <p className="mt-1 font-semibold text-slate-800">HashiCorp Raft v3</p>
+            <p className="mt-1 font-semibold text-slate-800">
+              {runtimeConfig?.consensus_engine.protocol || 'HashiCorp Raft (v1.7.2)'}
+            </p>
+            <p className="mt-0.5 text-[11px] text-slate-500 font-mono">
+              {runtimeConfig?.consensus_engine.storage_engine || 'BoltDB + Snapshots'}
+            </p>
           </div>
 
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-400">Quorum Rule</span>
-            <p className="mt-1 font-semibold text-slate-800">2 of 3 Nodes (Majority)</p>
+            <span className="text-slate-400">Quorum Rule &amp; Active Leader</span>
+            <p className="mt-1 font-semibold text-slate-800">
+              {runtimeConfig?.consensus_engine.quorum_rule || '2 of 3 Coordinators'}
+            </p>
+            <p className="mt-0.5 text-[11px] font-mono text-blue-700">
+              Leader: {runtimeConfig?.consensus_engine.current_leader_id || 'Probing...'}
+            </p>
           </div>
 
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-400">Safety Invariant</span>
+            <span className="text-slate-400">Safety Invariant &amp; mTLS</span>
             <p className="mt-1 font-semibold text-blue-700">Consistency First • Fail Closed</p>
+            <p className="mt-0.5 text-[11px] font-mono text-slate-600">
+              Raft Peer mTLS: {runtimeConfig ? (runtimeConfig.consensus_engine.mtls_enabled ? 'Enabled' : 'Plaintext TCP') : 'Checking...'}
+            </p>
           </div>
 
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-400">Audit Store</span>
-            <p className="mt-1 font-semibold text-slate-800">PostgreSQL 16 (Port 5435)</p>
+            <span className="text-slate-400">Audit &amp; Benchmark Store</span>
+            <p className="mt-1 font-semibold text-slate-800">
+              {runtimeConfig?.runtime.database_target || 'PostgreSQL 16'}
+            </p>
           </div>
 
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-400">Protected Resource</span>
-            <p className="mt-1 font-semibold text-slate-800">Port 9000 (Fencing Verified)</p>
+            <span className="text-slate-400">Lease TTL &amp; Heartbeat Policy</span>
+            <p className="mt-1 font-semibold text-slate-800 font-mono">
+              TTL {runtimeConfig ? `${runtimeConfig.lease_policy.min_ttl_sec}s–${runtimeConfig.lease_policy.max_ttl_sec}s (def ${runtimeConfig.lease_policy.default_ttl_sec}s)` : 'Configured via ENV'}
+            </p>
+            <p className="mt-0.5 text-[11px] font-mono text-slate-500">
+              Protected Resource: {runtimeConfig?.runtime.protected_resource_url || 'http://protected-resource:9000'}
+            </p>
           </div>
 
           <div className="p-3 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-400">JWT Secret &amp; Keys</span>
-            <p className="mt-1 font-semibold text-slate-600 font-mono">•••••••••••••••• (Masked)</p>
+            <span className="text-slate-400">JWT Secret &amp; Auth Policy</span>
+            <p className="mt-1 font-semibold text-slate-600 font-mono">
+              {runtimeConfig?.security.jwt_secret_configured ? '•••••••••••••••• (Masked)' : 'Unconfigured'}
+            </p>
+            <p className="mt-0.5 text-[11px] text-slate-500 font-mono">
+              {runtimeConfig ? `${runtimeConfig.security.jwt_algorithm} · ${runtimeConfig.security.jwt_expiration_hours}h expiry` : 'HS256'}
+            </p>
           </div>
         </div>
       </div>

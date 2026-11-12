@@ -14,6 +14,7 @@ import (
 	"lockguard/backend/internal/consensus"
 	"lockguard/backend/internal/coordinator"
 	"lockguard/backend/internal/lockstate"
+	"lockguard/backend/internal/metrics"
 	"lockguard/backend/internal/middleware"
 )
 
@@ -93,10 +94,107 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup coordinator HTTP handlers
-	coordHandler := coordinator.NewHandler(raftNode, cfg.Raft.NodeID)
+	// Setup coordinator HTTP handlers and metrics
+	coordMetrics := metrics.NewRegistry()
+	coordHandler := coordinator.NewHandlerWithMetrics(raftNode, cfg.Raft.NodeID, coordMetrics)
 	mux := http.NewServeMux()
 	coordHandler.RegisterRoutes(mux)
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_, leaderID := raftNode.Leader()
+		coordMetrics.SetQuorumAvailable(leaderID != "" && !raftNode.IsPartitioned())
+		if rCfg, err := raftNode.GetConfiguration(); err == nil {
+			coordMetrics.SetClusterNodesAvailable(len(rCfg.Servers))
+		}
+		coordMetrics.IncHTTPRequest(r.Method, "2xx")
+		coordMetrics.Handler()(w, r)
+	})
+
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+
+		var lastLeader string
+		var quorumLostAt time.Time
+		for {
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-ticker.C:
+				_, leaderID := raftNode.Leader()
+				curLeader := string(leaderID)
+				partitioned := raftNode.IsPartitioned()
+
+				if partitioned || curLeader == "" {
+					coordMetrics.SetQuorumAvailable(false)
+					if lastLeader != "" && quorumLostAt.IsZero() {
+						quorumLostAt = time.Now()
+					}
+					continue
+				}
+
+				coordMetrics.SetQuorumAvailable(true)
+				if lastLeader == "" {
+					lastLeader = curLeader
+					if !quorumLostAt.IsZero() {
+						coordMetrics.SetRecoveryDuration("leader_election", time.Since(quorumLostAt).Seconds())
+						quorumLostAt = time.Time{}
+					}
+					continue
+				}
+				if curLeader != lastLeader {
+					coordMetrics.IncLeaderChanges()
+					if !quorumLostAt.IsZero() {
+						coordMetrics.SetRecoveryDuration("leader_election", time.Since(quorumLostAt).Seconds())
+						quorumLostAt = time.Time{}
+					}
+					lastLeader = curLeader
+				}
+			}
+		}
+	}()
+
+	// Leader-side fallback lease reaper ensures Raft FSM converges even if the API gateway is offline.
+	// Uses a short grace period past ExpiresAtUnixNano so the API gateway reaper runs first and emits LOCK_EXPIRE audit rows.
+	go func() {
+		reapTicker := time.NewTicker(1 * time.Second)
+		defer reapTicker.Stop()
+
+		for {
+			select {
+			case <-monitorCtx.Done():
+				return
+			case <-reapTicker.C:
+				if !raftNode.IsLeader() || raftNode.IsPartitioned() {
+					continue
+				}
+				nowNs := time.Now().UnixNano()
+				cutoffNs := nowNs - int64(2*time.Second)
+				expired := raftNode.ListExpiredLocksAt(cutoffNs)
+				for _, rec := range expired {
+					if monitorCtx.Err() != nil {
+						return
+					}
+					cmd := lockstate.ExpireLockCommand{
+						RequestID:                 fmt.Sprintf("coord-reap-%s-%d-%d", rec.ResourceName, rec.FencingToken, rec.LeaseVersion),
+						ResourceName:              rec.ResourceName,
+						ExpectedOwnerID:           rec.OwnerID,
+						ExpectedFencingToken:      rec.FencingToken,
+						ExpectedLeaseVersion:      rec.LeaseVersion,
+						ExpectedExpiresAtUnixNano: rec.ExpiresAtUnixNano,
+						TimestampUnixNano:         nowNs,
+					}
+					reapCtx, cancel := context.WithTimeout(monitorCtx, 2*time.Second)
+					_, _ = raftNode.ApplyCommand(reapCtx, cmd)
+					cancel()
+				}
+			}
+		}
+	}()
 
 	var httpHandler http.Handler = mux
 	httpHandler = middleware.RequestLogger(logger)(httpHandler)
@@ -123,6 +221,7 @@ func main() {
 	}()
 
 	sig := <-stopChan
+	monitorCancel()
 	logger.Info("coordinator_stopping", slog.String("signal", sig.String()))
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)

@@ -376,3 +376,86 @@ func TestAuditAuthorizationAndCrossClientIsolation(t *testing.T) {
 	}
 }
 
+func TestAuditHandler_AuthFailureAndAuthzDenialMetricsExactness(t *testing.T) {
+	repo := &mockAuditRepo{}
+	_ = repo.InsertEvent(context.Background(), &persistence.AuditEventRecord{
+		EventID:         "evt-owned-b",
+		EventType:       TypeLockAcquire,
+		EventCategory:   CategoryLockOperation,
+		ResourceID:      "res-b",
+		ClientID:        "client-B",
+		OperationStatus: StatusCommitted,
+		RecordedAt:      time.Now().UTC(),
+		EventTimestamp:  time.Now().UTC(),
+	})
+
+	cfg := &config.Config{
+		Environment: "test",
+		Auth: config.AuthConfig{
+			Enabled:      true,
+			JWTSecretKey: "secret-audit-key",
+		},
+	}
+	reg := metrics.NewRegistry()
+	h := NewHandler(repo, nil, cfg)
+	h.SetMetricsRegistry(reg)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	// Two 401 failures (missing header + invalid token)
+	w1 := httptest.NewRecorder()
+	mux.ServeHTTP(w1, httptest.NewRequest(http.MethodGet, "/v1/audit/events", nil))
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/audit/events", nil)
+	req2.Header.Set("Authorization", "Bearer bad-token")
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w2.Code)
+	}
+
+	// Two 403 denials (cross-client resource query + cross-client event ID)
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/audit/resources/res-b?client_id=client-B", nil)
+	req3.Header.Set("Authorization", "Bearer client:client-A")
+	w3 := httptest.NewRecorder()
+	mux.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w3.Code)
+	}
+
+	req4 := httptest.NewRequest(http.MethodGet, "/v1/audit/events/evt-owned-b", nil)
+	req4.Header.Set("Authorization", "Bearer client:client-A")
+	w4 := httptest.NewRecorder()
+	mux.ServeHTTP(w4, req4)
+	if w4.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w4.Code)
+	}
+
+	// Valid 200 and invalid filter 400 must not touch auth/authz counters
+	req5 := httptest.NewRequest(http.MethodGet, "/v1/audit/events?start_time=not-rfc3339", nil)
+	req5.Header.Set("Authorization", "Bearer admin")
+	w5 := httptest.NewRecorder()
+	mux.ServeHTTP(w5, req5)
+	if w5.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on bad filter, got %d", w5.Code)
+	}
+
+	req6 := httptest.NewRequest(http.MethodGet, "/v1/audit/events", nil)
+	req6.Header.Set("Authorization", "Bearer admin")
+	w6 := httptest.NewRecorder()
+	mux.ServeHTTP(w6, req6)
+	if w6.Code != http.StatusOK {
+		t.Fatalf("expected 200 on admin audit query, got %d", w6.Code)
+	}
+
+	if got := reg.GetCounterTotal("lockguard_auth_failures_total"); got != 2 {
+		t.Fatalf("expected lockguard_auth_failures_total=2, got %d", got)
+	}
+	if got := reg.GetCounterTotal("lockguard_authz_denials_total"); got != 2 {
+		t.Fatalf("expected lockguard_authz_denials_total=2, got %d", got)
+	}
+}
+
